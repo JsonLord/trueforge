@@ -11,6 +11,8 @@ import type {
   PreSendContextProcessor,
 } from '../capabilities/AgentContextProcessor';
 import { SUB_AGENT_IDENTITY } from '../capabilities/builtins/DynamicSubAgents';
+import type { FastPathAdmissionPolicy } from '../capabilities/FastPathAdmission';
+import type { RequestClassification, RequestClassifier, RequestMetadata } from '../capabilities/RequestClassifier';
 import type { ToolResponseProcessor } from '../capabilities/ToolResponseProcessor';
 import { AgentHarnessError, InvalidAgentSendInputError } from '../errors';
 import type { RegisteredPassthroughEvent } from '../events/PassthroughEvents';
@@ -52,6 +54,8 @@ import { estimateTokensForString } from '../llm/usage';
 import { convertMCPServersToTools, type ConvertToolsResult, type MappedMCPTool } from '../mcp/convertMCPServers';
 import { executeToolCalls } from '../mcp/executeToolCalls';
 import type { IToolSet, MCPAuthRequired } from '../mcp/IMCPServer';
+import { applyToolArgumentExtraction, type ToolArgumentExtractor } from '../mcp/ToolArgumentExtractor';
+import { parseAndValidateToolArguments } from '../mcp/ToolArgumentValidation';
 import type { Sandbox, SandboxInfo } from '../sandbox/Sandbox';
 import type { AgentTracing } from '../tracing/AgentTracing';
 import { describeUnknownError, extractErrorLogFields } from '../util/errorLogFields';
@@ -98,6 +102,11 @@ import { getClosableOpenToolCallIds, OpenToolCallCloser } from './OpenToolCallCl
 import { isEmptyMessageContent, processAgentUserInput, type AgentInputUserMessage } from './UserInputMessage';
 
 const DEFAULT_ITERATION_LIMIT = 25;
+const UNKNOWN_REQUEST_CLASSIFICATION: RequestClassification = {
+  complexity: 'unknown',
+  actionClass: 'unknown',
+  confidence: 0,
+};
 
 type AgentThreadState = 'llm-call-required' | 'tool-response-required' | 'user-input-required';
 
@@ -471,6 +480,24 @@ function tryParseToolArgs(args: string | undefined): Record<string, unknown> {
   }
 }
 
+function latestUserQuery(context: ContextMessage[]): string | undefined {
+  for (let index = context.length - 1; index >= 0; index--) {
+    const message = context[index];
+    if (!message || !isLLMContextMessage(message) || message.role !== 'user') {
+      continue;
+    }
+    if (typeof message.content === 'string') {
+      return message.content;
+    }
+    const text = message.content
+      .flatMap(part => (part.type === 'text' ? [part.text] : []))
+      .join('\n')
+      .trim();
+    return text || undefined;
+  }
+  return undefined;
+}
+
 // State-sync contract: in-memory state must stay consistent with what the consumer
 // def foo():
 //   for x in range(1, 10):
@@ -501,6 +528,10 @@ export class AgentThread {
   private instructionBuilders: readonly ((builder: InstructionBuilder) => void)[];
   private systemToolSets: readonly IToolSet[];
   private deferredTool?: DeferredTool | undefined;
+  private readonly toolArgumentExtractor: ToolArgumentExtractor | undefined;
+  private readonly requestClassifier: RequestClassifier | undefined;
+  private readonly fastPathAdmissionPolicy: FastPathAdmissionPolicy | undefined;
+  private shadowAdmissionToolCalls: InternalEnrichedToolCall[] = [];
   private convertedTools: ConvertToolsResult | undefined;
   private pendingSandboxCreatedEvents: SandboxCreatedEvent[] = [];
   private sandbox?: Sandbox | undefined;
@@ -508,6 +539,7 @@ export class AgentThread {
   private readonly logger: Logger;
 
   private metrics: AgentThreadMetrics = createEmptyAgentThreadMetrics();
+  private requestMetadata: RequestMetadata = { classification: undefined, fastPathAdmission: undefined };
   private tfyManagedServerNames = new Set<string>();
 
   private contextBusy = false;
@@ -538,6 +570,27 @@ export class AgentThread {
     this.postToolCallContextProcessor = capabilities.flatMap(c => c.postToolCallProcessors ?? []);
     this.toolResponseProcessors = capabilities.flatMap(c => c.toolResponseProcessors ?? []);
     this.instructionBuilders = capabilities.flatMap(c => c.instructionBuilders ?? []);
+    const toolArgumentExtractors = capabilities.flatMap(capability =>
+      capability.toolArgumentExtractor ? [capability.toolArgumentExtractor] : [],
+    );
+    if (toolArgumentExtractors.length > 1) {
+      throw new Error('Only one tool argument extractor may be configured');
+    }
+    this.toolArgumentExtractor = toolArgumentExtractors[0];
+    const requestClassifiers = capabilities.flatMap(capability =>
+      capability.requestClassifier ? [capability.requestClassifier] : [],
+    );
+    if (requestClassifiers.length > 1) {
+      throw new Error('Only one request classifier may be configured');
+    }
+    this.requestClassifier = requestClassifiers[0];
+    const fastPathAdmissionPolicies = capabilities.flatMap(capability =>
+      capability.fastPathAdmissionPolicy ? [capability.fastPathAdmissionPolicy] : [],
+    );
+    if (fastPathAdmissionPolicies.length > 1) {
+      throw new Error('Only one fast-path admission policy may be configured');
+    }
+    this.fastPathAdmissionPolicy = fastPathAdmissionPolicies[0];
     const capabilityPreSend = capabilities.flatMap(c => c.preSendProcessors ?? []);
     // OpenToolCallCloser is fixed core before contributed preSend processors.
     this.preSendContextProcessors = [new OpenToolCallCloser(), ...capabilityPreSend];
@@ -559,9 +612,16 @@ export class AgentThread {
     }
 
     if (this.definition.toolSets?.length) {
+      const deferredToolSelectorPolicies = capabilities.flatMap(capability =>
+        capability.deferredToolSelectorPolicy ? [capability.deferredToolSelectorPolicy] : [],
+      );
+      if (deferredToolSelectorPolicies.length > 1) {
+        throw new Error('Only one deferred tool selector policy may be configured');
+      }
       this.deferredTool = new DeferredTool(this.definition.toolSets, {
         tracing: this.tracing,
         logger: input.logger,
+        selectorPolicy: deferredToolSelectorPolicies[0],
       });
     }
 
@@ -654,6 +714,9 @@ export class AgentThread {
           currentContextUsage: undefined,
           usage: undefined,
         });
+      }
+      if (contextMessages.some(message => message.role === 'user')) {
+        await this.classifyCurrentRequest();
       }
     } finally {
       this.contextBusy = false;
@@ -778,7 +841,89 @@ export class AgentThread {
     return { ...this.metrics };
   }
 
-  private transformToLLMRequest(tools: ChatCompletionTool[]): LLMCreateParamsStreaming {
+  public getRequestMetadata(): Readonly<RequestMetadata> {
+    return {
+      classification: this.requestMetadata.classification ? { ...this.requestMetadata.classification } : undefined,
+      fastPathAdmission: this.requestMetadata.fastPathAdmission
+        ? {
+            ...this.requestMetadata.fastPathAdmission,
+            reasons: [...this.requestMetadata.fastPathAdmission.reasons],
+          }
+        : undefined,
+    };
+  }
+
+  private async classifyCurrentRequest(): Promise<void> {
+    this.shadowAdmissionToolCalls = [];
+    const query = latestUserQuery(this.context);
+    if (!this.requestClassifier || !query) {
+      this.requestMetadata = { classification: undefined, fastPathAdmission: undefined };
+      return;
+    }
+    try {
+      const classification = await this.requestClassifier.classify({
+        query,
+        toolsAvailable:
+          (this.definition.toolSets?.length ?? 0) > 0 || this.systemToolSets.length > 0 || this.sandbox !== undefined,
+      });
+      this.requestMetadata = { classification, fastPathAdmission: undefined };
+    } catch (error) {
+      void error;
+      this.logger.warn('Request classification failed open', { fallbackReason: 'classifier_error' });
+      this.requestMetadata = { classification: UNKNOWN_REQUEST_CLASSIFICATION, fastPathAdmission: undefined };
+    }
+  }
+
+  private evaluateShadowFastPathAdmission(params: {
+    assistantMessage: InternalEnrichedAssistantMessage;
+    toolMapping: Map<string, MappedMCPTool>;
+  }): void {
+    if (!this.fastPathAdmissionPolicy) {
+      return;
+    }
+    this.shadowAdmissionToolCalls.push(...(params.assistantMessage.tool_calls ?? []));
+    if (this.shadowAdmissionToolCalls.length === 0) {
+      return;
+    }
+    const startedAt = Date.now();
+    const selectedToolCount = this.shadowAdmissionToolCalls.length;
+    const selectedToolCall = selectedToolCount === 1 ? this.shadowAdmissionToolCalls[0] : undefined;
+    const mappedTool = selectedToolCall ? params.toolMapping.get(selectedToolCall.function.name) : undefined;
+    const tool = mappedTool ? { serverId: mappedTool.toolSet.id, toolName: mappedTool.originalToolName } : undefined;
+    const argumentsValidated =
+      selectedToolCall && mappedTool
+        ? parseAndValidateToolArguments({
+            schema: mappedTool.schema.inputSchema,
+            serializedArguments: selectedToolCall.function.arguments,
+          })
+        : undefined;
+    const result = this.fastPathAdmissionPolicy.evaluate({
+      classification: this.requestMetadata.classification,
+      selectedToolCount,
+      tool,
+      toolExplicitlyEligible: tool ? this.fastPathAdmissionPolicy.isToolExplicitlyEligible(tool) : undefined,
+      argumentsValidated,
+      approvalRequired: selectedToolCall?.tool_info.is_approval_required,
+      policyVeto: mappedTool ? false : true,
+    });
+    this.requestMetadata = {
+      ...this.requestMetadata,
+      fastPathAdmission: { evaluated: true, ...result },
+    };
+    this.logger.debug('Shadow fast-path admission evaluated', {
+      shadowEnabled: true,
+      eligible: result.eligible,
+      reasons: result.reasons,
+      classificationConfidence: this.requestMetadata.classification?.confidence,
+      toolId: tool ? `${tool.serverId}:${tool.toolName}` : undefined,
+      selectedToolCount,
+      approvalRequired: selectedToolCall?.tool_info.is_approval_required,
+      argumentsValidated,
+      latencyMs: Date.now() - startedAt,
+    });
+  }
+
+  private async transformToLLMRequest(tools: ChatCompletionTool[]): Promise<LLMCreateParamsStreaming> {
     let messages: ChatCompletionMessageParam[] = [];
 
     if (this.instruction) {
@@ -803,7 +948,7 @@ export class AgentThread {
     messages.push(...contextMessages);
 
     for (const processor of this.preEphemeralLLMContextProcessors) {
-      messages = processor.processPreLLMEphemeral(messages) ?? messages;
+      messages = (await processor.processPreLLMEphemeral(messages)) ?? messages;
     }
 
     // modelParams may include provider extensions (e.g. reasoning_effort) beyond the SDK's
@@ -1015,7 +1160,7 @@ export class AgentThread {
       yield event;
     }
 
-    const requestBody = this.transformToLLMRequest(tools);
+    const requestBody = await this.transformToLLMRequest(tools);
     const llmStream = this.definition.modelClient.create(requestBody);
 
     // We start the delta stream with a model message event.
@@ -1070,8 +1215,15 @@ export class AgentThread {
       usage: result.value.usage,
       toolMapping,
     });
-    const assistantMessage: InternalEnrichedAssistantMessage = await enrichAssistantMessage({
+    const assistantWithExtractedArguments = await applyToolArgumentExtraction({
       assistantMessage: result.value.output,
+      toolMapping,
+      extractor: this.toolArgumentExtractor,
+      query: latestUserQuery(this.context),
+      logger: this.logger,
+    });
+    const assistantMessage: InternalEnrichedAssistantMessage = await enrichAssistantMessage({
+      assistantMessage: assistantWithExtractedArguments,
       toolMapping,
       // During context persistence, we have the complete message and hence the tool arguments are available.
       // Hence, we resolve the underlying tool to get the tool information.
@@ -1080,7 +1232,7 @@ export class AgentThread {
     const finishReason = result.value.finish_reason;
     const agentAssistantMessage = buildModelMessageEvent({
       assistantMessage: await enrichAssistantMessage({
-        assistantMessage: result.value.output,
+        assistantMessage: assistantWithExtractedArguments,
         toolMapping,
         // Same unresolved wrapper as SSE deltas so listTurnEvents matches a folded stream.
         resolveUnderlyingTool: false,
@@ -1121,6 +1273,8 @@ export class AgentThread {
       usage: result.value.usage,
       completion,
     });
+
+    this.evaluateShadowFastPathAdmission({ assistantMessage, toolMapping });
 
     if (finishReason === 'length') {
       const errorContent = completion?.error_message ?? 'max_tokens breached';

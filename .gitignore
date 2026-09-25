@@ -43,3 +43,4 @@ service-account*.json
 
 .certs/
 *.pyc
+artifacts/needle-eval/

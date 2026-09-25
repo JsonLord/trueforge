@@ -1,12 +1,13 @@
 import type { ChatCompletionTool } from 'openai/resources/chat';
 import type { MCPServerInitInfo } from '../events/schema';
 import type { MCPAuthRequired } from '../mcp/IMCPServer';
-import { type IToolSet, isAuthRequired } from './IMCPServer';
+import { type AgentToolSchema, type IToolSet, isAuthRequired } from './IMCPServer';
 import { getUniqueSanitizedToolName } from './toolNames';
 
 export interface MappedMCPTool {
   toolSet: IToolSet;
   originalToolName: string;
+  schema: AgentToolSchema;
 }
 
 export interface ConvertToolsResult {
@@ -87,6 +88,7 @@ export async function convertMCPServersToTools(params: {
       toolMapping.set(toolName, {
         toolSet,
         originalToolName: mcpTool.name,
+        schema: mcpTool,
       });
     }
   }

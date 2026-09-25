@@ -9,6 +9,10 @@ import {
   toolRequiresApproval,
 } from './toolSelectors';
 
+export interface DeferredToolSelectorPolicy {
+  selectTools(input: { query: string; tools: AgentToolSchema[]; serverName: string }): Promise<AgentToolSchema[]>;
+}
+
 /**
  * Per-server tool selectors. Enable/disable/preload tags: `@all`, `@read-only`.
  * Approval tags: `@all`, `@write`, `@destructive`.

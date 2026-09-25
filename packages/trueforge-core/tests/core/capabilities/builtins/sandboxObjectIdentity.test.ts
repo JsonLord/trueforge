@@ -18,6 +18,7 @@ function makeToolResult(toolSet: IToolSet, name: string): ToolCallResult {
     info: {
       toolSet,
       originalToolName: name,
+      schema: { name, inputSchema: { type: 'object' }, preload: true },
     },
     failure: false,
     isStructuredContent: false,

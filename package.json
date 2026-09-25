@@ -19,6 +19,7 @@
     "dev:no-watch": "cross-env STANDALONE=false NODE_ENV=development pnpm --parallel --filter @truefoundry/trueforge --filter frontend dev:no-watch",
     "dev:server:ui": "pnpm --filter frontend build && pnpm --filter @truefoundry/trueforge build:frontend-assets && cross-env STANDALONE=false NODE_ENV=development pnpm --parallel --filter @truefoundry/trueforge-core --filter @truefoundry/trueforge dev",
     "dev": "cross-env STANDALONE=false NODE_ENV=development pnpm --parallel --filter @truefoundry/trueforge-core --filter @truefoundry/trueforge --filter frontend dev",
+    "eval:needle-live": "pnpm --filter @truefoundry/trueforge-core eval:needle-live",
     "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,json,md}\" --cache --cache-location .prettiercache --cache-strategy content --error-on-unmatched-pattern --config .prettierrc",
     "format:fix": "prettier --write \"**/*.{js,jsx,ts,tsx,json,md}\" --cache --cache-location .prettiercache --cache-strategy content --config .prettierrc",
     "format": "prettier --write . --cache --cache-location .prettiercache --cache-strategy content --config .prettierrc",
