@@ -58,7 +58,7 @@ class CactusNeedleBackend:
             },
         }
         try:
-            agent = needle.Needle(model=model, generation=3, tools=[classifier])
+            agent = needle.Needle(weights=model, generation=3, tools=[classifier])
         except Exception as caught:
             return cls(_needle=needle, _unavailable_reason=f"Needle initialization failed: {type(caught).__name__}")
         return cls(_needle=needle, _agent=agent)
@@ -80,17 +80,23 @@ class CactusNeedleBackend:
         agent = self._agent_or_raise()
         agent.reset()
         result = agent.complete(
-            f"Classify this canonical request. Tools available: {str(tools_available).lower()}. Request: {request}"
+            "Classify the following user request as simple or reasoning, and read, write, destructive, or "
+            f"external_side_effect. Call classify_request. User request: {request}"
         )
-        calls = getattr(result, "function_calls", None)
+        if not isinstance(result, dict):
+            raise RuntimeError("Needle returned a malformed classification response")
+        calls = result.get("function_calls") or result.get("suppressed_calls")
         if not isinstance(calls, list) or not calls:
             raise RuntimeError("Needle returned no classification proposal")
-        arguments = getattr(calls[0], "arguments", None)
+        call = calls[0]
+        if not isinstance(call, dict):
+            raise RuntimeError("Needle returned a malformed classification call")
+        arguments = call.get("arguments")
         if not isinstance(arguments, dict):
             raise RuntimeError("Needle returned malformed classification arguments")
         return {
             **arguments,
-            "confidence": getattr(calls[0], "confidence", getattr(result, "confidence", None)),
+            "confidence": result.get("confidence"),
         }
 
     def embed(self, inputs: list[str]) -> dict[str, Any]:
@@ -99,7 +105,12 @@ class CactusNeedleBackend:
 
     def extract(self, request: str, tool: dict[str, str], schema: dict[str, Any]) -> dict[str, Any]:
         self._agent_or_raise()
-        value = self._needle.extract(request, schema)
+        extraction_schema = {
+            "name": tool["toolName"],
+            "description": f"Extract arguments for {tool['toolName']}.",
+            "parameters": schema,
+        }
+        value = self._needle.extract(request, extraction_schema, weights=os.environ["NEEDLE_MODEL_PATH"], generation=3)
         if not isinstance(value, dict):
             raise RuntimeError("Needle returned malformed extraction arguments")
         return {"arguments": value, "confidence": None}
