@@ -45,5 +45,7 @@ export interface PostToolCallAgentContextProcessor {
 
 // NOTE: Not saved in Redis, Not saved in AgentThread in memory. Not persisted accross Agent Loop.
 export interface PreLLMEphemeralAgentContextProcessor {
-  processPreLLMEphemeral(input: ChatCompletionMessageParam[]): ChatCompletionMessageParam[] | undefined;
+  processPreLLMEphemeral(
+    input: ChatCompletionMessageParam[],
+  ): ChatCompletionMessageParam[] | undefined | Promise<ChatCompletionMessageParam[] | undefined>;
 }

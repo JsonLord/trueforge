@@ -16,6 +16,7 @@ import {
   toolResultResponse,
 } from '../mcp/IMCPServer';
 import { defineTool, LocalToolMCP, type ToolDefinition } from '../mcp/LocalToolMCP';
+import type { DeferredToolSelectorPolicy } from '../mcp/ToolSelectorPolicy';
 import type { AgentTracing } from '../tracing/AgentTracing';
 import { extractErrorLogFields } from '../util/errorLogFields';
 
@@ -29,6 +30,7 @@ const MAX_DESCRIPTION_LENGTH = 200;
 
 const listToolsSchema = z.object({
   mcp_server: z.string().describe('Name of the MCP server to list tools for.'),
+  query: z.string().optional().describe('Current request intent used to rank relevant tools.'),
 });
 
 const getToolInfoSchema = z.object({
@@ -71,13 +73,17 @@ export class DeferredTool extends LocalToolMCP {
     options: {
       tracing: AgentTracing;
       logger: Logger;
+      selectorPolicy?: DeferredToolSelectorPolicy | undefined;
     },
   ) {
     super({ tracing: options.tracing });
     this.logger = options.logger.child({ module: 'DeferredTool' });
     this.serverMap = new Map(servers.map(s => [s.name, s]));
     this.tools = this.buildTools();
+    this.selectorPolicy = options.selectorPolicy;
   }
+
+  private readonly selectorPolicy: DeferredToolSelectorPolicy | undefined;
 
   buildInstruction(builder: InstructionBuilder): void {
     const servers = [...this.serverMap.values()];
@@ -175,15 +181,19 @@ export class DeferredTool extends LocalToolMCP {
         List tool names available on an MCP server.
         Returns tool names only — use ${GET_TOOL_INFO_NAME} to get full details before calling a tool.`,
       schema: listToolsSchema,
-      handler: async (input: { mcp_server: string }) => {
+      handler: async (input: { mcp_server: string; query?: string | undefined }) => {
         try {
           const resolved = await this.resolveServerTools(input.mcp_server);
           if (!isResolvedServerTools(resolved)) {
             return resolved;
           }
           const { server, tools, metadata } = resolved;
+          const selectedTools =
+            input.query?.trim() && this.selectorPolicy
+              ? await this.selectorPolicy.selectTools({ query: input.query, tools, serverName: server.name })
+              : tools;
           return toolResultResponse({
-            text: `${server.name}:\n  ${tools.map(t => t.name).join(', ')}`,
+            text: `${server.name}:\n  ${selectedTools.map(t => t.name).join(', ')}`,
             overrides: metadata,
           });
         } catch (error) {

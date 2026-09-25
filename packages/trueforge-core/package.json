@@ -96,6 +96,7 @@
     "build:check": "node scripts/check-dist.mjs",
     "typecheck": "pnpm run build:gen && tsc --noEmit",
     "test": "pnpm run build:gen && jest --config jest.config.cjs",
+    "eval:needle-live": "pnpm run build && node scripts/evaluate-needle-live.mjs",
     "pack:dry": "pnpm pack --dry-run"
   },
   "dependencies": {

@@ -1,11 +1,15 @@
 import type { InstructionBuilder } from '../InstructionBuilder';
 import type { IToolSet } from '../mcp/IMCPServer';
+import type { ToolArgumentExtractor } from '../mcp/ToolArgumentExtractor';
+import type { DeferredToolSelectorPolicy } from '../mcp/ToolSelectorPolicy';
 import type {
   PostToolCallAgentContextProcessor,
   PreLLMAgentContextProcessor,
   PreLLMEphemeralAgentContextProcessor,
   PreSendContextProcessor,
 } from './AgentContextProcessor';
+import type { FastPathAdmissionPolicy } from './FastPathAdmission';
+import type { RequestClassifier } from './RequestClassifier';
 import type { ToolResponseProcessor } from './ToolResponseProcessor';
 
 /**
@@ -25,6 +29,10 @@ export interface AgentCapability {
   readonly postToolCallProcessors?: readonly PostToolCallAgentContextProcessor[] | undefined;
   readonly toolResponseProcessors?: readonly ToolResponseProcessor[] | undefined;
   readonly instructionBuilders?: readonly ((builder: InstructionBuilder) => void)[] | undefined;
+  readonly deferredToolSelectorPolicy?: DeferredToolSelectorPolicy | undefined;
+  readonly toolArgumentExtractor?: ToolArgumentExtractor | undefined;
+  readonly requestClassifier?: RequestClassifier | undefined;
+  readonly fastPathAdmissionPolicy?: FastPathAdmissionPolicy | undefined;
   /**
    * Cross-turn durable state. `key` must be unique across capabilities on a
    * thread (`tfy.` reserved for builtins). `load` hydrates from the previous

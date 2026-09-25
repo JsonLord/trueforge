@@ -30,6 +30,58 @@ export type {
   PostToolCallAgentContextProcessor,
   PreLLMEphemeralAgentContextProcessor,
 } from './capabilities/AgentContextProcessor';
+export {
+  ConservativeFastPathAdmissionPolicy,
+  DEFAULT_FAST_PATH_MIN_CLASSIFICATION_CONFIDENCE,
+  shadowFastPathAdmission,
+} from './capabilities/FastPathAdmission';
+export type {
+  FastPathAdmissionInput,
+  FastPathAdmissionMetadata,
+  FastPathAdmissionPolicy,
+  FastPathAdmissionReason,
+  FastPathAdmissionResult,
+  FastPathToolIdentity,
+  ShadowFastPathAdmissionOptions,
+} from './capabilities/FastPathAdmission';
+export type {
+  RequestActionClass,
+  RequestClassification,
+  RequestClassifier,
+  RequestComplexity,
+  RequestMetadata,
+} from './capabilities/RequestClassifier';
+
+// Offline evaluation
+export { FAST_PATH_ADMISSION_EVAL_CASES } from './evaluation/fastPathAdmissionCorpus';
+export {
+  createFastPathEvaluationArtifact,
+  evaluateFastPathAdmission,
+  simulateFastPathAdmissionThresholds,
+} from './evaluation/FastPathAdmissionEvaluation';
+export type {
+  FastPathClassificationReplayEntry,
+  FastPathEvalCase,
+  FastPathEvaluationArtifact,
+  FastPathEvaluationCaseResult,
+  FastPathEvaluationResult,
+  FastPathEvaluationSummary,
+  FastPathThresholdSimulationResult,
+} from './evaluation/FastPathAdmissionEvaluation';
+export { runNeedleLiveEvaluation } from './evaluation/NeedleLiveEvaluation';
+export type { NeedleLiveCaseStability, NeedleLiveEvaluationResult } from './evaluation/NeedleLiveEvaluation';
+export { REQUEST_CLASSIFICATION_EVAL_CASES } from './evaluation/requestClassificationCorpus';
+export { evaluateClassificationReplay, evaluateRequestClassifier } from './evaluation/RequestClassificationEvaluation';
+export type {
+  ClassificationClassMetrics,
+  ClassificationEvalCase,
+  ClassificationEvalCaseResult,
+  ClassificationEvalFallbackReason,
+  ClassificationEvalResult,
+  ClassificationEvalSummary,
+  ClassificationLatencyMetrics,
+  ClassificationReplayEntry,
+} from './evaluation/RequestClassificationEvaluation';
 
 // Built-in factories
 export { askUserQuestion } from './capabilities/builtins/AskUserQuestion';
@@ -39,6 +91,13 @@ export {
 } from './capabilities/builtins/ContextCompaction';
 export { currentDateTime } from './capabilities/builtins/CurrentDateTime';
 export { SUB_AGENT_IDENTITY, dynamicSubAgents } from './capabilities/builtins/DynamicSubAgents';
+export { headroom } from './capabilities/builtins/Headroom';
+export type {
+  HeadroomClient,
+  HeadroomOptimizeInput,
+  HeadroomOptimizeResult,
+  HeadroomOptions,
+} from './capabilities/builtins/Headroom';
 export {
   DEFAULT_INDIVIDUAL_TOOL_TOKEN_THRESHOLD,
   DEFAULT_PREVIEW_NUMBER_OF_CHARACTERS,
@@ -74,11 +133,14 @@ export type { ToolDefinition } from './mcp/LocalToolMCP';
 // Remote MCP server, split into a shared, policy-free connection (`RemoteMCP`) and a per-agent policy
 // wrapper (`ToolSet`). `RemoteMCP` connects itself from a `url` + `headers`; the networking helpers
 // live in the harness-internal `remoteMcpClient` module.
+export { NeedleToolSelectorPolicy, needleToolSelection } from './mcp/NeedleToolSelectorPolicy';
+export type { NeedleClient, NeedleToolSelectorOptions } from './mcp/NeedleToolSelectorPolicy';
 export { RemoteMCP } from './mcp/RemoteMCP';
 export type { RemoteMcpHeaders, ResolveHeadersResult } from './mcp/RemoteMCP';
 export { DEFAULT_MAX_MCP_RESPONSE_BYTES } from './mcp/remoteMcpClient';
 export type { RemoteMcpConnection, RemoteMcpTransportType } from './mcp/remoteMcpClient';
-export type { ToolSelectorConfig } from './mcp/ToolSelectorPolicy';
+export type { ToolArgumentExtractor } from './mcp/ToolArgumentExtractor';
+export type { DeferredToolSelectorPolicy, ToolSelectorConfig } from './mcp/ToolSelectorPolicy';
 export {
   DEFAULT_DISABLE_TOOLS,
   DEFAULT_ENABLE_TOOLS,
