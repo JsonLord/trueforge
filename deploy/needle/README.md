@@ -90,5 +90,25 @@ starting the service, and adjust only that boundary if the installed signatures 
 - [ ] one-run live evaluator
 - [ ] five-run live evaluator
 
-Active fast-path routing, model bypass, automatic approval, classification-based authorization, and Needle-owned tool
-execution are explicitly out of scope.
+> **PRODUCTION ARCHITECTURE DECISION:**
+> **Needle is not used in the TrueForge production request path.**
+
+### Final Capability Matrix
+
+| Capability | Decision | Empirical Basis |
+|---|---|---|
+| **Needle Runtime** | **KEEP** | Runtime integration, loopback HTTP gateway, introspection, and container bootstrap verified. |
+| **Needle Classification** | **DISABLE FOR ROUTING** | FAILED safety evaluation. Universal `simple+read` bias, 16 unsafe errors/run, restart confidence instability. |
+| **Needle Argument Extraction** | **FALLBACK / EXPERIMENTAL** | FAILED semantic quality on required fixture (`JsonLord/trueforge` repo split failure). Native confidence unavailable. |
+| **Needle Embedding Retrieval** | **DISABLE / REMOVE FROM HOT PATH** | FAILED production gate. Configured Top-5 recall (18.42%) far below 99% requirement; 81.58% miss rate excludes correct tools. |
+| **Needle Structured Proposal** | **RESEARCH ONLY** | 36.67% wrong-action selection rate; zero accuracy improvement over embeddings alone. |
+| **Needle Two-Stage Pipeline** | **RESEARCH ONLY** | Zero accuracy improvement over embeddings alone; preserves high action mismatch rate. |
+| **Needle Active Fast Path** | **DO NOT IMPLEMENT** | Active fast path is BLOCKED by classifier validation failure and high retrieval miss rates. |
+
+### Capability-Specific Service Usage Guidelines
+
+- `/v1/embed`: Candidate for runtime use if production retrieval evaluation passes.
+- `/v1/classify`: Evaluation / research / debug metadata only. MUST NOT be used for active routing, authorization, approval suppression, or fast-path admission.
+- `/v1/extract`: Experimental / fallback-only.
+
+Operation timing metrics (`queueWaitMs`, `executionMs`, `totalMs`) are tracked per serialized gateway call while maintaining strict single-worker inference serialization for safety.

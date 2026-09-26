@@ -35,7 +35,7 @@ def confidence_value(value: Any, *, nullable: bool = False) -> float | None:
     return result
 
 
-def classification(value: Any) -> dict[str, Any]:
+def classification(value: Any, metrics: dict[str, float] | None = None) -> dict[str, Any]:
     result = object_value(value, "classification")
     complexity = result.get("complexity")
     action_class = result.get("actionClass")
@@ -43,14 +43,17 @@ def classification(value: Any) -> dict[str, Any]:
         raise ContractError("invalid complexity")
     if action_class not in ACTION_CLASSES:
         raise ContractError("invalid actionClass")
-    return {
+    response: dict[str, Any] = {
         "complexity": complexity,
         "actionClass": action_class,
         "confidence": confidence_value(result.get("confidence")),
     }
+    if metrics is not None:
+        response["metrics"] = metrics
+    return response
 
 
-def vectors(value: Any, expected_count: int) -> dict[str, list[list[float]]]:
+def vectors(value: Any, expected_count: int, metrics: dict[str, float] | None = None) -> dict[str, Any]:
     result = object_value(value, "embedding result").get("vectors")
     if not isinstance(result, list) or len(result) != expected_count:
         raise ContractError("vector response count does not match input count")
@@ -69,10 +72,19 @@ def vectors(value: Any, expected_count: int) -> dict[str, list[list[float]]]:
                 raise ContractError("vectors must contain finite numbers")
             normalized.append(float(item))
         output.append(normalized)
-    return {"vectors": output}
+    response: dict[str, Any] = {"vectors": output}
+    if metrics is not None:
+        response["metrics"] = metrics
+    return response
 
 
-def extraction(value: Any) -> dict[str, Any]:
+def extraction(value: Any, metrics: dict[str, float] | None = None) -> dict[str, Any]:
     result = object_value(value, "extraction result")
     arguments = object_value(result.get("arguments"), "arguments")
-    return {"arguments": arguments, "confidence": confidence_value(result.get("confidence"), nullable=True)}
+    response: dict[str, Any] = {
+        "arguments": arguments,
+        "confidence": confidence_value(result.get("confidence"), nullable=True),
+    }
+    if metrics is not None:
+        response["metrics"] = metrics
+    return response
