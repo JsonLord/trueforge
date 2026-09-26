@@ -90,28 +90,20 @@ starting the service, and adjust only that boundary if the installed signatures 
 - [ ] one-run live evaluator
 - [ ] five-run live evaluator
 
-Active fast-path routing status: **BLOCKED BY CLASSIFIER VALIDATION FAILURE**.
-Model bypass, automatic approval, classification-based authorization, and Needle-owned tool execution are strictly forbidden.
+> **PRODUCTION ARCHITECTURE DECISION:**
+> **Needle is not used in the TrueForge production request path.**
 
-> **WARNING:** Needle 3 request classification failed the TrueForge safety evaluation and MUST NOT be used for routing,
-> authorization, approval suppression, or fast-path admission.
->
-> Status: **FAILED — NOT SUITABLE FOR ROUTING**
->
-> - Five-run predictions were universally `simple + read`;
-> - Writes, destructive, and external-side-effect requests were underclassified;
-> - 16 unsafe simple/read errors occurred per run;
-> - Confidence is not semantically reliable;
-> - Process restart changed confidence enough to alter admission behavior.
->
-> Needle classifier may remain available ONLY for evaluation/research/debug metadata, NOT runtime authority.
+### Final Capability Matrix
 
-### Capability Status Matrix
-
-- **Needle Request Classification**: `requestClassificationEnabled = false` (default). Status: **FAILED — NOT SUITABLE FOR ROUTING**.
-- **Needle Argument Extraction**: `argumentExtractionEnabled = false` (default). Status: **IMPLEMENTED, RUNTIME VERIFIED, SEMANTIC QUALITY FAILED, FALLBACK-ONLY**.
-- **Needle Active Fast Path**: Status: **BLOCKED BY CLASSIFIER VALIDATION FAILURE**.
-- **Needle Embedding Retrieval**: `enabled = false` (default). Production Hypothesis: `embedding-based ToolSelectorPolicy candidate reduction`. Non-authoritative, fail-open, unable to broaden tools, unable to execute, unable to approve, unable to remove security checks.
+| Capability | Decision | Empirical Basis |
+|---|---|---|
+| **Needle Runtime** | **KEEP** | Runtime integration, loopback HTTP gateway, introspection, and container bootstrap verified. |
+| **Needle Classification** | **DISABLE FOR ROUTING** | FAILED safety evaluation. Universal `simple+read` bias, 16 unsafe errors/run, restart confidence instability. |
+| **Needle Argument Extraction** | **FALLBACK / EXPERIMENTAL** | FAILED semantic quality on required fixture (`JsonLord/trueforge` repo split failure). Native confidence unavailable. |
+| **Needle Embedding Retrieval** | **DISABLE / REMOVE FROM HOT PATH** | FAILED production gate. Configured Top-5 recall (18.42%) far below 99% requirement; 81.58% miss rate excludes correct tools. |
+| **Needle Structured Proposal** | **RESEARCH ONLY** | 36.67% wrong-action selection rate; zero accuracy improvement over embeddings alone. |
+| **Needle Two-Stage Pipeline** | **RESEARCH ONLY** | Zero accuracy improvement over embeddings alone; preserves high action mismatch rate. |
+| **Needle Active Fast Path** | **DO NOT IMPLEMENT** | Active fast path is BLOCKED by classifier validation failure and high retrieval miss rates. |
 
 ### Capability-Specific Service Usage Guidelines
 

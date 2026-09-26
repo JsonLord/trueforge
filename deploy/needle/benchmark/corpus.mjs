@@ -1,4 +1,7 @@
-// Extended retrieval evaluation corpus with 150+ queries and 50+ tools across categories
+/**
+ * NOT PRODUCTION ROUTING - RESEARCH AND EVALUATION TOOLING ONLY
+ * Extended retrieval evaluation corpus with 150+ queries and 46 tools across categories.
+ */
 
 export const CATEGORIES = {
   FILESYSTEM: 'filesystem',

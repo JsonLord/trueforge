@@ -1,3 +1,7 @@
+/**
+ * NOT PRODUCTION ROUTING - RESEARCH AND EVALUATION TOOLING ONLY
+ * Offline / research evaluation harness for Needle retrieval, stability, cache, and structured proposal.
+ */
 import { createNeedleClient } from '../adapter/client.mjs';
 import { runCacheLiveVerification } from './cache-live.mjs';
 import { ALL_TOOLS, BENCHMARK_QUERIES } from './corpus.mjs';
@@ -29,6 +33,7 @@ async function main() {
       ['Read package.json.', [0, 1]],
     ]);
     activeClient = {
+      isMockClient: true,
       embed: async inputs => inputs.map(input => values.get(input) ?? [0.5, 0.5]),
       selectTools: async ({ candidates }) => ({
         toolIds: [candidates[0]?.id],

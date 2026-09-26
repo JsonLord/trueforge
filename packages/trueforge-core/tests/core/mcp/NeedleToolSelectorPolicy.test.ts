@@ -9,8 +9,29 @@ function tool(name: string, description: string): AgentToolSchema {
 const tools = [tool('list_pull_requests', 'Find open pull requests'), tool('weather', 'Read a weather forecast')];
 
 describe('NeedleToolSelectorPolicy', () => {
-  test('is disabled by default', () => {
-    expect(needleToolSelection({ client: { embed: jest.fn() }, logger: makeSilentLogger() })).toEqual({});
+  test('is disabled by default and performs zero client invocations when disabled', async () => {
+    const embed = jest.fn();
+    const classifyRequest = jest.fn();
+    const extractToolArguments = jest.fn();
+    const client = { embed, classifyRequest, extractToolArguments };
+    const logger = makeSilentLogger();
+
+    const capability = needleToolSelection({ client, logger });
+    expect(capability).toEqual({});
+
+    const policy = new NeedleToolSelectorPolicy({ client, logger });
+
+    const classification = await policy.classify({ query: 'test query', toolsAvailable: true });
+    expect(classification).toEqual({ complexity: 'unknown', actionClass: 'unknown', confidence: 0 });
+    expect(classifyRequest).not.toHaveBeenCalled();
+
+    const extraction = await policy.extract({ query: 'test query', tool: tools[0]!, currentArguments: {} });
+    expect(extraction).toBeUndefined();
+    expect(extractToolArguments).not.toHaveBeenCalled();
+
+    const selected = await policy.selectTools({ query: 'test query', tools, serverName: 'srv' });
+    expect(selected).toBe(tools);
+    expect(embed).not.toHaveBeenCalled();
   });
 
   test.each([

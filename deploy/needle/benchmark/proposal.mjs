@@ -158,5 +158,14 @@ export async function compareEmbeddingVsStructuredProposal({
     });
   }
 
-  return { resultsByCandidateCount };
+  return {
+    resultsByCandidateCount,
+    liveValidated: Boolean(client.selectTools && !client.isMockClient),
+    executionMode: client.isMockClient
+      ? 'NOT_LIVE_VALIDATED_MOCK_FALLBACK'
+      : 'LIVE_NEEDLE_SERVICE',
+    timingNote: client.isMockClient
+      ? 'Timing reflects parent-side mock orchestration only (<0.1 ms). Real native Needle complete() inference latency is approximately ~314 ms per call.'
+      : 'Measured against live Needle service.',
+  };
 }
