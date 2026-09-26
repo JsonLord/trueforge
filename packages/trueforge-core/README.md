@@ -13,14 +13,35 @@ schema fingerprint and falls back to the complete authorized tool list when disa
 or uncertain. Tool calls still pass through the existing `ToolSet`, approval, and deferred execution paths; the
 integration does not execute tools.
 
-Needle argument extraction is separately opt-in with `argumentExtractionEnabled: true`. Valid, sufficiently confident
-proposals replace the main model's arguments before the assistant tool call is persisted, then pass through canonical
-JSON Schema validation and the existing approval, security, and `ToolSet` execution path. Invalid or unavailable
-proposals retain the main model's original arguments.
+Needle argument extraction is separately opt-in with `argumentExtractionEnabled: true`. `argumentExtractionEnabled = false`
+remains the production default.
 
-Needle request classification is separately opt-in with `requestClassificationEnabled: true`. It records a conservative
-complexity, action class, and confidence in request-scoped metadata and structured logs. Classification reads only the
-latest canonical user request and currently has no effect on models, tools, approvals, routing, or execution.
+Status:
+
+- **IMPLEMENTED**
+- **RUNTIME VERIFIED**
+- **SEMANTIC QUALITY FAILED**
+- **FALLBACK-ONLY**
+
+In live verification on required fixtures, native extraction produced `{ "owner": "JsonLord/trueforge", "repo": "open", "state": "open" }`
+instead of `{ "owner": "JsonLord", "repo": "trueforge", "state": "open" }`, and native extraction confidence is unavailable.
+Invalid or unavailable proposals retain the main model's original arguments.
+
+Needle request classification is separately opt-in with `requestClassificationEnabled: true`. `requestClassificationEnabled = false`
+remains the mandatory production default.
+
+> **WARNING:** Needle 3 request classification failed the TrueForge safety evaluation and MUST NOT be used for routing,
+> authorization, approval suppression, or fast-path admission.
+>
+> Status: **FAILED — NOT SUITABLE FOR ROUTING**
+>
+> - Five-run predictions were universally `simple + read`;
+> - Writes, destructive, and external-side-effect requests were underclassified;
+> - 16 unsafe simple/read errors occurred per run;
+> - Confidence is not semantically reliable;
+> - Process restart changed confidence enough to alter admission behavior.
+>
+> Needle classifier may remain available ONLY for evaluation/research/debug metadata, NOT runtime authority.
 
 ### Evaluating request classification
 
@@ -53,8 +74,9 @@ opaque fallbacks without changing the production threshold.
 ### Shadow fast-path admission
 
 `shadowFastPathAdmission(...)` evaluates whether a completed main-model tool choice would meet a hypothetical
-read-only fast-path policy. It is disabled by default and only records request metadata and metadata-only logs. It
-cannot skip the model, invoke tools, alter approvals, or route execution.
+read-only fast-path policy. Active fast path status: **BLOCKED BY CLASSIFIER VALIDATION FAILURE**.
+It is disabled by default and only records request metadata and metadata-only logs. It cannot skip the model,
+invoke tools, alter approvals, or route execution.
 
 Admission fails closed unless classification is a sufficiently confident `simple`/`read`, exactly one registered tool
 was selected, its final arguments match the canonical tool schema, approval is explicitly not required, no policy

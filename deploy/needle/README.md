@@ -90,5 +90,33 @@ starting the service, and adjust only that boundary if the installed signatures 
 - [ ] one-run live evaluator
 - [ ] five-run live evaluator
 
-Active fast-path routing, model bypass, automatic approval, classification-based authorization, and Needle-owned tool
-execution are explicitly out of scope.
+Active fast-path routing status: **BLOCKED BY CLASSIFIER VALIDATION FAILURE**.
+Model bypass, automatic approval, classification-based authorization, and Needle-owned tool execution are strictly forbidden.
+
+> **WARNING:** Needle 3 request classification failed the TrueForge safety evaluation and MUST NOT be used for routing,
+> authorization, approval suppression, or fast-path admission.
+>
+> Status: **FAILED — NOT SUITABLE FOR ROUTING**
+>
+> - Five-run predictions were universally `simple + read`;
+> - Writes, destructive, and external-side-effect requests were underclassified;
+> - 16 unsafe simple/read errors occurred per run;
+> - Confidence is not semantically reliable;
+> - Process restart changed confidence enough to alter admission behavior.
+>
+> Needle classifier may remain available ONLY for evaluation/research/debug metadata, NOT runtime authority.
+
+### Capability Status Matrix
+
+- **Needle Request Classification**: `requestClassificationEnabled = false` (default). Status: **FAILED — NOT SUITABLE FOR ROUTING**.
+- **Needle Argument Extraction**: `argumentExtractionEnabled = false` (default). Status: **IMPLEMENTED, RUNTIME VERIFIED, SEMANTIC QUALITY FAILED, FALLBACK-ONLY**.
+- **Needle Active Fast Path**: Status: **BLOCKED BY CLASSIFIER VALIDATION FAILURE**.
+- **Needle Embedding Retrieval**: `enabled = false` (default). Production Hypothesis: `embedding-based ToolSelectorPolicy candidate reduction`. Non-authoritative, fail-open, unable to broaden tools, unable to execute, unable to approve, unable to remove security checks.
+
+### Capability-Specific Service Usage Guidelines
+
+- `/v1/embed`: Candidate for runtime use if production retrieval evaluation passes.
+- `/v1/classify`: Evaluation / research / debug metadata only. MUST NOT be used for active routing, authorization, approval suppression, or fast-path admission.
+- `/v1/extract`: Experimental / fallback-only.
+
+Operation timing metrics (`queueWaitMs`, `executionMs`, `totalMs`) are tracked per serialized gateway call while maintaining strict single-worker inference serialization for safety.

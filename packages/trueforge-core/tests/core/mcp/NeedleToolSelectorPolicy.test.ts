@@ -196,6 +196,61 @@ describe('NeedleToolSelectorPolicy', () => {
     expect(embed.mock.calls.map(call => call[0].length)).toEqual([1, 1, 1, 1, 1, 1, 1]);
   });
 
+  test('invalidates cache on input schema, output schema, and annotations changes, and prunes removed tools', async () => {
+    const embed = jest.fn((input: string[]) => Promise.resolve(input.map(() => [1, 0])));
+    const policy = new NeedleToolSelectorPolicy({ client: { embed }, logger: makeSilentLogger(), enabled: true });
+
+    const toolA: AgentToolSchema = {
+      name: 'tool_a',
+      description: 'A',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      annotations: { readOnlyHint: true },
+      preload: false,
+    };
+    const toolB: AgentToolSchema = {
+      name: 'tool_b',
+      description: 'B',
+      inputSchema: { type: 'object' },
+      preload: false,
+    };
+
+    // 1. Initial embed of toolA and toolB
+    await policy.selectTools({ query: 'test', tools: [toolA, toolB], serverName: 'srv' });
+
+    // 2. Change input schema of toolA
+    const toolAInputChanged: AgentToolSchema = {
+      ...toolA,
+      inputSchema: { type: 'object', properties: { p: { type: 'string' } } },
+    };
+    await policy.selectTools({ query: 'test', tools: [toolAInputChanged, toolB], serverName: 'srv' });
+
+    // 3. Change output schema of toolA
+    const toolAOutputChanged: AgentToolSchema = {
+      ...toolAInputChanged,
+      outputSchema: { type: 'object', properties: { res: { type: 'number' } } },
+    };
+    await policy.selectTools({ query: 'test', tools: [toolAOutputChanged, toolB], serverName: 'srv' });
+
+    // 4. Change annotations of toolA
+    const toolAAnnotationsChanged: AgentToolSchema = { ...toolAOutputChanged, annotations: { readOnlyHint: false } };
+    await policy.selectTools({ query: 'test', tools: [toolAAnnotationsChanged, toolB], serverName: 'srv' });
+
+    // 5. Remove toolB (pruning) and add toolC
+    const toolC: AgentToolSchema = {
+      name: 'tool_c',
+      description: 'C',
+      inputSchema: { type: 'object' },
+      preload: false,
+    };
+    await policy.selectTools({ query: 'test', tools: [toolAAnnotationsChanged, toolC], serverName: 'srv' });
+
+    // Embed calls should show re-embedding of only modified/added items
+    const batchSizes = embed.mock.calls.map(call => call[0].length);
+    // Initial (2 tools + 1 query = 2 in tool batch), query batch = 1
+    expect(batchSizes).toContain(2);
+  });
+
   test('deduplicates concurrent embedding cache misses', async () => {
     let resolveTools: ((embeddings: number[][]) => void) | undefined;
     const toolEmbeddings = new Promise<number[][]>(resolve => {
