@@ -1,0 +1,238 @@
+From f4f31276d11e21ac86457e2aeb5dce13ea83a410 Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 09:54:57 +0200
+Subject: [PATCH] Add single-owner Harbor mode and public Space address
+
+---
+ Dockerfile                                    |  4 +++
+ README.md                                     | 25 +++++++++++++
+ apps/harbor/CONTRACT.md                       |  2 ++
+ apps/harbor/packages/server/src/auth-local.ts | 33 +++++++++++++++++
+ apps/harbor/packages/server/src/main.ts       | 36 +++++++++++++++++++
+ apps/harbor/packages/server/src/sql-pglite.ts |  4 +--
+ .../packages/server/test/local-token.test.ts  | 36 +++++++++++++++++++
+ 7 files changed, 138 insertions(+), 2 deletions(-)
+ create mode 100644 apps/harbor/packages/server/src/auth-local.ts
+ create mode 100644 apps/harbor/packages/server/test/local-token.test.ts
+
+diff --git a/Dockerfile b/Dockerfile
+index d94f7ba..de04097 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -8,6 +8,10 @@ RUN pnpm build
+ FROM node:22-slim
+ ENV NODE_ENV=production
+ ENV PORT=7860
++ENV HARBOR_MODE=single
++ENV HARBOR_ADDRESS=leon4gr45-rowboat.hf.space
++ENV PGLITE_DIR=/data/pglite
++ENV BLOBS_DIR=/data/blobs
+ WORKDIR /app/apps/harbor
+ COPY --from=build /app/apps/harbor ./
+ EXPOSE 7860
+diff --git a/README.md b/README.md
+index ab7f563..75c83ed 100644
+--- a/README.md
++++ b/README.md
+@@ -350,6 +350,31 @@ In the app, open the Spaces dialog, choose *Add a dev server*, and point it at `
+ | `BLOBS_DIR` or `BLOBS_S3_BUCKET` | Where uploads go: local disk, or any S3-compatible bucket (`BLOBS_S3_ENDPOINT`, `BLOBS_S3_REGION`). |
+ | `PORT` | Defaults to 4272. |
+ 
++**Single-owner self-hosting without an external login provider.** Set
++`HARBOR_MODE=single`, `HARBOR_ADDRESS` to the public hostname (without
++`https://`), and `HARBOR_LOCAL_TOKEN` to a private random key of at least
++32 characters. Set either `DATABASE_URL` or `PGLITE_DIR`, plus `BLOBS_DIR`
++or S3 blob storage. The directory paths must live on persistent storage.
++This mode seeds one owner and a Personal space; it accepts only that owner's
++key. Generate a key with `openssl rand -hex 32` and supply it as a deployment
++secret, never in the Dockerfile or repository. In the desktop Rowboat app,
++use **Spaces → Add a dev server**, enter `https://<HARBOR_ADDRESS>` and paste
++the key into the **Member id** field. The app prefixes it with `dev-` on
++the wire; the server maps it to the owner. After that, the landing page's
++**Open in Rowboat** button opens the saved server in the desktop app.
++
++For the Hugging Face Space in this repository, the Dockerfile sets the
++address and storage paths to `leon4gr45-rowboat.hf.space` and `/data`.
++Attach a private, read-write Storage Bucket at `/data` and configure
++`HARBOR_LOCAL_TOKEN` as a Space secret before deploying this image.
++A missing key or storage directory setting causes startup to fail rather
++than exposing dev auth. The server cannot detect an unmounted `/data`;
++without the bucket, its data will disappear on restart. For databases
++where durability matters, a Postgres `DATABASE_URL` is the safer option
++until PGlite has been verified on the bucket mount.
++Anyone with the key can act as the owner; this mode is for one person,
++not separate team accounts.
++
+ The wire contract between Harbor and everything that talks to it is the `@rowboat/spaces-protocol` package; [`apps/harbor/CONTRACT.md`](apps/harbor/CONTRACT.md) is its narrative, including the merge semantics, the invite ceremony, and what is deliberately still v0. Expect breaking changes while we dogfood.
+ 
+ ## Bring any agent to a Space
+diff --git a/apps/harbor/CONTRACT.md b/apps/harbor/CONTRACT.md
+index df50eb5..917888e 100644
+--- a/apps/harbor/CONTRACT.md
++++ b/apps/harbor/CONTRACT.md
+@@ -192,6 +192,8 @@ Amended 2026-08-25 (relative links, a client convention — no wire change): a *
+ 
+ Amended 2026-08-19 ([spec §4](./SPEC.md#4-orgs-and-identity): invites/profile/roles): an invite is one shape — an **open bearer secret**; acceptance binds to the authenticated (issuer, subject), and **every bind-time condition is org policy checked in one place at acceptance** (v1: the email-domain rule; a per-person email-bound invite variant was considered and dropped — policy checks never live in the token). Wire impact when built: the accept path gains a policy-refused state; `Member` gains the org-level **admin bit** (membership/policy powers only — the content plane stays role-flat) and later a `handle` (org-unique, deferred until human mentions ship; attribution keys on member id, never name/handle).
+ 
++Amended 2026-09-29 (single-owner self-hosting): `HARBOR_MODE=single` uses one locally managed access key instead of an external issuer. The existing desktop dev-server client sends `dev-<access key>`; Harbor validates it against the configured secret and maps it to the provisioned owner. No arbitrary `dev-<memberId>` token is accepted in this mode. The normal OIDC deployment and local development modes retain their existing behavior. The landing’s `org` target is configured from the server’s public hostname.
++
+ **5. The agent face is thirty MCP tools** (`mcp.ts`): `whoami`, `list_members`, `list_spaces`, `open_direct`, `create_space`, `rename_space`, `leave_space`, `create_invite`, `read_stream`, `read_thread`, `read_activity`, `mark_all_read`, `search_space`, `post_message`, `edit_message`, `delete_message`, `react`, `vote_poll`, `end_poll`, `list_topics`, `create_topic`, `manage_topic`, `create_asset`, `read_asset`, `propose_change`, `move_asset`, `delete_asset`, `restore_asset`, `asset_history`, `diff` — direct projections of the core operations. Semantics live in the tool design: `list_spaces` makes discovery mechanical (space ids + full file listings, each file with its id and path, in one call — agents never guess ids, and never depend on the README-link convention), reads bundle recent history, conflicts return current content + history, so any well-behaved agent gets read-before-write and retry for free. `reason` is **required** on the MCP face (optional on REST) — the spec's "agents always attach a why" convention, enforced where only agents call. Rowboat's own agent uses these exact tools; no privileged path. Spec §9. (Escape hatch: if dogfood grows spaces with very large file counts, the inline listings in `list_spaces` split or paginate — a v0-legal change.)
+ 
+ Amended 2026-09-09 (parity): **the agent face projects every member operation the render face has** — identity (`whoami`), roster (`list_members`, backed by the new `GET /v1/members`: the union of the caller's space rosters, DMs included), DMs, space lifecycle, invites, message edit/delete/react, polls (create, vote, end), file restore/history/diff, versioned reads. An agent acting for a member can do whatever that member can do in the app; **an agent's vote, reaction, or edit is the member's act**, attributed by `actingMode` + `agentName` (how it happened, never who else). The earlier "agents are silent / don't react / don't vote" posture — the twelve-tool face and the `actingMode === 'direct'` refusals on `votePoll`/`endPoll` — is retired; guidance about WHEN an agent should act lives in the agent's skill, not in the tool surface. `reason` stays required on every namespace op (`create_asset`, `propose_change`, `move_asset`, `delete_asset`, `restore_asset`). `readOnlyMcpToolNames` names the pure reads.
+diff --git a/apps/harbor/packages/server/src/auth-local.ts b/apps/harbor/packages/server/src/auth-local.ts
+new file mode 100644
+index 0000000..82bfd12
+--- /dev/null
++++ b/apps/harbor/packages/server/src/auth-local.ts
+@@ -0,0 +1,33 @@
++import { createHash, timingSafeEqual } from 'node:crypto';
++import type { Member } from '@rowboat/spaces-protocol';
++import type { AuthDriver, AuthIdentity } from './auth.js';
++import { HarborError } from './errors.js';
++import type { Store } from './store.js';
++
++/** One locally managed access key for a single-owner Harbor, without an external IdP. */
++export class LocalTokenAuthDriver implements AuthDriver {
++  private readonly digest: Buffer;
++
++  constructor(token: string, private readonly memberId: string) {
++    if (token.length < 32) throw new Error('HARBOR_LOCAL_TOKEN must contain at least 32 characters');
++    this.digest = createHash('sha256').update(token).digest();
++  }
++
++  async authenticate(authorization: string | undefined, queryToken?: string | null): Promise<AuthIdentity> {
++    // The desktop app's Add a dev server dialog sends dev-<entered access key>.
++    const raw = authorization?.startsWith('Bearer ') ? authorization.slice(7) : queryToken;
++    const candidate = raw?.startsWith('dev-') ? raw.slice(4) : undefined;
++    if (!candidate || !timingSafeEqual(this.digest, createHash('sha256').update(candidate).digest())) {
++      throw new HarborError('unauthorized', 'invalid local access key');
++    }
++    return { iss: 'local', sub: this.memberId };
++  }
++
++  async resolveMember(store: Store, identity: AuthIdentity): Promise<Member> {
++    const member = identity.iss === 'local' && identity.sub === this.memberId
++      ? await store.getMember(this.memberId)
++      : undefined;
++    if (!member) throw new HarborError('not_a_member', 'local owner is not provisioned');
++    return member;
++  }
++}
+diff --git a/apps/harbor/packages/server/src/main.ts b/apps/harbor/packages/server/src/main.ts
+index 30a4747..ff4be13 100644
+--- a/apps/harbor/packages/server/src/main.ts
++++ b/apps/harbor/packages/server/src/main.ts
+@@ -2,6 +2,7 @@
+ import path from 'node:path';
+ import type { AuthDriver } from './auth.js';
+ import { OidcAuthDriver } from './auth-oidc.js';
++import { LocalTokenAuthDriver } from './auth-local.js';
+ import type { BlobStore } from './blobs.js';
+ import { DiskBlobStore } from './blobs-disk.js';
+ import { S3BlobStore } from './blobs-s3.js';
+@@ -128,10 +129,45 @@ if (process.env.HARBOR_MODE === 'deployment') {
+   console.log(`  internal   ${process.env.HARBOR_INTERNAL_KEY ? 'GET /internal/stats (operator key set)' : 'off (set HARBOR_INTERNAL_KEY)'}`);
+   console.log(`  listening  :${deployment.port}`);
+   process.on('SIGTERM', () => void deployment.close().then(() => process.exit(0)));
++} else if (process.env.HARBOR_MODE === 'single') {
++  await startSingleHarbor();
+ } else {
+   await startDevHarbor();
+ }
+ 
++async function startSingleHarbor(): Promise<void> {
++  // A public single-owner server must never silently fall back to dev tokens
++  // or an in-memory database when its deployment configuration is incomplete.
++  for (const name of ['HARBOR_ADDRESS', 'HARBOR_LOCAL_TOKEN'] as const) {
++    if (!process.env[name]) throw new Error(`HARBOR_MODE=single requires ${name}`);
++  }
++  if (!process.env.DATABASE_URL && !process.env.PGLITE_DIR) {
++    throw new Error('HARBOR_MODE=single requires DATABASE_URL or PGLITE_DIR');
++  }
++  if (!process.env.BLOBS_DIR && !process.env.BLOBS_S3_BUCKET) {
++    throw new Error('HARBOR_MODE=single requires BLOBS_DIR or BLOBS_S3_BUCKET');
++  }
++  const db = process.env.DATABASE_URL
++    ? postgresDb(process.env.DATABASE_URL, poolOpts)
++    : await (await import('./sql-pglite.js')).pgliteDb(process.env.PGLITE_DIR);
++  const store = new PgStore(db);
++  await store.init();
++  const owner = process.env.HARBOR_OWNER_ID ?? 'owner';
++  const harbor = await startHarbor({
++    port,
++    store,
++    address: process.env.HARBOR_ADDRESS!,
++    orgName: process.env.HARBOR_ORG ?? 'Personal Harbor',
++    auth: new LocalTokenAuthDriver(process.env.HARBOR_LOCAL_TOKEN!, owner),
++    blobs: blobStoreFactory()!('org-default'),
++    seedMembers: [{ id: owner, displayName: process.env.HARBOR_OWNER_NAME ?? 'Owner' }],
++    seedSpaces: [{ name: 'Personal', creator: owner }],
++    ...internal,
++  });
++  console.log(`Harbor (single owner) at ${harbor.url}; public address ${harbor.address}`);
++  process.on('SIGTERM', () => void harbor.close().then(() => process.exit(0)));
++}
++
+ async function startDevHarbor(): Promise<void> {
+ // Durable Postgres via DATABASE_URL; otherwise the same store in-process on
+ // PGlite (restart = clean slate). The WASM engine is loaded here and only
+diff --git a/apps/harbor/packages/server/src/sql-pglite.ts b/apps/harbor/packages/server/src/sql-pglite.ts
+index 20394e5..d2ab876 100644
+--- a/apps/harbor/packages/server/src/sql-pglite.ts
++++ b/apps/harbor/packages/server/src/sql-pglite.ts
+@@ -9,8 +9,8 @@ import type { SqlDb, SqlExecutor } from './sql.js';
+ // reproduce a two-connection race — that needs a real server). main.ts loads
+ // this by dynamic import on the dev path only; deployment mode never touches it.
+ 
+-export async function pgliteDb(): Promise<SqlDb> {
+-  const db = new PGlite();
++export async function pgliteDb(dataDir?: string): Promise<SqlDb> {
++  const db = new PGlite(dataDir);
+   await db.waitReady;
+   const executor = (q: PGlite | Parameters<Parameters<PGlite['transaction']>[0]>[0]): SqlExecutor => ({
+     async query<R>(text: string, params?: unknown[]): Promise<R[]> {
+diff --git a/apps/harbor/packages/server/test/local-token.test.ts b/apps/harbor/packages/server/test/local-token.test.ts
+new file mode 100644
+index 0000000..cc06879
+--- /dev/null
++++ b/apps/harbor/packages/server/test/local-token.test.ts
+@@ -0,0 +1,36 @@
++import { afterEach, describe, expect, it } from 'vitest';
++import { LocalTokenAuthDriver } from '../src/auth-local.js';
++import type { RunningHarbor } from '../src/server.js';
++import { startTestHarbor } from './helpers.js';
++
++const key = 'a'.repeat(64);
++let harbor: RunningHarbor | undefined;
++afterEach(async () => { await harbor?.close(); harbor = undefined; });
++
++describe('single-owner local access', () => {
++  it('requires a substantial secret', () => {
++    expect(() => new LocalTokenAuthDriver('short', 'owner')).toThrow(/32 characters/);
++  });
++
++  it('authenticates only the configured owner key on the wire and links to the public host', async () => {
++    harbor = await startTestHarbor({
++      auth: new LocalTokenAuthDriver(key, 'owner'),
++      address: 'leon4gr45-rowboat.hf.space',
++      seedMembers: [{ id: 'owner', displayName: 'Owner' }],
++      seedSpaces: [{ name: 'Personal', creator: 'owner' }],
++    });
++    const url = harbor.url;
++    const get = async (token?: string) => fetch(`${url}/v1/spaces`, {
++      headers: token ? { authorization: `Bearer ${token}` } : {},
++    });
++    expect((await get()).status).toBe(401);
++    expect((await get('dev-owner')).status).toBe(401);
++    expect((await get('dev-' + 'b'.repeat(64))).status).toBe(401);
++    const ok = await get(`dev-${key}`);
++    expect(ok.status).toBe(200);
++    expect((await ok.json())?.spaces).toHaveLength(1);
++    const landing = await (await fetch(url)).text();
++    expect(landing).toContain('org=leon4gr45-rowboat.hf.space');
++    expect(landing).not.toContain('org=localhost');
++  });
++});
+-- 
+2.51.1
+
