@@ -78,7 +78,7 @@ export function createAccessLogMiddleware(logger: Logger): MiddlewareHandler {
     const started = performance.now();
     await next();
     const path = c.req.path;
-    if (path === '/healthz' || path.startsWith('/assets/')) {
+    if (path === '/healthz' || path === '/health' || path.startsWith('/assets/')) {
       return;
     }
     logger.info('request', {
@@ -248,6 +248,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   }
   app.use('*', createRequestBodyLimitMiddleware(configuration.MAX_REQUEST_BODY_BYTES));
 
+  app.get('/health', c => c.json({ status: 'ok', version: PACKAGE_VERSION }));
   app.get('/healthz', c => c.json({ status: 'ok', version: PACKAGE_VERSION }));
 
   app.route(
@@ -473,6 +474,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   const openApiSpecPath = `${uiBasePath}api/v1/openapi.json`;
   const openApiServerUrl = uiBasePath === '/' ? undefined : uiBasePath.replace(/\/$/, '');
   app.get('/api/v1/docs', swaggerUI({ url: openApiSpecPath }));
+  app.get('/api-docs', swaggerUI({ url: openApiSpecPath }));
   app.get('/api/v1/openapi.json', c =>
     c.json(
       buildOpenApiDocument(app, {
