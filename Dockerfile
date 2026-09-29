@@ -1,33 +1,74 @@
 # syntax=docker/dockerfile:1
-#
-# Production image: installs published @truefoundry/trueforge from npm.
-# The app bits match the npm package exactly (not floating monorepo source).
-#
-# Required build-arg:
-#   APP_VERSION — npm version to install, e.g. 0.1.0
-#
-# Example:
-#   docker build --build-arg APP_VERSION=0.1.0 -t trueforge:0.1.0 .
-
-FROM node:24-slim AS runner
+FROM node:24-slim AS base
+ENV PNPM_HOME=/pnpm
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable && pnpm config set store-dir /pnpm/store
 WORKDIR /app
-# HOST=0.0.0.0 so Kubernetes Service/probe traffic reaches the process.
+
+FROM base AS store
+COPY pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm fetch
+
+FROM store AS workspace
+COPY package.json .npmrc tsconfig.base.json ./
+COPY scripts scripts
+COPY packages/trueforge-core/package.json packages/trueforge-core/package.json
+COPY packages/trueforge/package.json packages/trueforge/package.json
+COPY packages/trueforge-sdk/package.json packages/trueforge-sdk/package.json
+COPY packages/frontend/package.json packages/frontend/package.json
+COPY packages/trueforge-ui/package.json packages/trueforge-ui/package.json
+COPY packages/trueforge-core/scripts packages/trueforge-core/scripts
+COPY packages/trueforge-core/src/core/sandbox/scripts packages/trueforge-core/src/core/sandbox/scripts
+
+FROM workspace AS builder
+RUN pnpm install --frozen-lockfile --offline --filter @truefoundry/trueforge...
+COPY packages/trueforge-core packages/trueforge-core
+COPY packages/trueforge-sdk packages/trueforge-sdk
+RUN pnpm --filter @truefoundry/trueforge-sdk build
+COPY packages/trueforge packages/trueforge
+RUN pnpm --filter @truefoundry/trueforge-core build && pnpm --filter @truefoundry/trueforge build
+
+FROM workspace AS frontend-builder
+RUN pnpm install --frozen-lockfile --offline --filter frontend...
+COPY packages/trueforge-sdk packages/trueforge-sdk
+COPY packages/trueforge-ui packages/trueforge-ui
+RUN pnpm --filter @truefoundry/trueforge-ui build
+COPY packages/frontend packages/frontend
+RUN pnpm --filter frontend build
+
+FROM workspace AS prod-deps
+RUN pnpm install --frozen-lockfile --offline --prod --filter @truefoundry/trueforge...
+
+FROM base AS runner
+
 ENV NODE_ENV=production \
-    STANDALONE=false \
-    HOST=0.0.0.0
+    HOST=0.0.0.0 \
+    PORT=7860 \
+    STANDALONE=true \
+    HOME=/home/trueforge \
+    SQLITE_PATH=/home/trueforge/db.sqlite
 
-ARG APP_VERSION
-RUN test -n "$APP_VERSION" || (echo "APP_VERSION build-arg is required" >&2 && exit 1)
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/packages/trueforge-core/node_modules ./packages/trueforge-core/node_modules
+COPY --from=prod-deps /app/packages/trueforge/node_modules ./packages/trueforge/node_modules
 
-# Fail closed if the version is not on the registry (no workspace fallback).
-RUN npm install --omit=dev "@truefoundry/trueforge@${APP_VERSION}" \
-  && npm cache clean --force
+COPY --from=builder /app/packages/trueforge-core/package.json ./packages/trueforge-core/package.json
+COPY --from=builder /app/packages/trueforge-core/dist ./packages/trueforge-core/dist
+COPY --from=builder /app/packages/trueforge-sdk/package.json ./packages/trueforge-sdk/package.json
+COPY --from=builder /app/packages/trueforge-sdk/dist ./packages/trueforge-sdk/dist
+
+COPY --from=builder /app/packages/trueforge/package.json ./packages/trueforge/package.json
+COPY --from=builder /app/packages/trueforge/dist ./packages/trueforge/dist
+COPY --from=frontend-builder /app/packages/frontend/dist ./packages/trueforge/dist/_frontend
+
+WORKDIR /app/packages/trueforge
 
 RUN groupadd --gid 10001 trueforge \
-  && useradd --uid 10001 --gid trueforge --shell /usr/sbin/nologin trueforge
+  && useradd --uid 10001 --gid trueforge -m trueforge \
+  && mkdir -p /home/trueforge \
+  && chown -R 10001:10001 /home/trueforge /app
 
-EXPOSE 8790
+EXPOSE 7860
 
-# Same entry as the from-source image / `pnpm start` (launch-only; dist is in the package).
 USER 10001:10001
-CMD ["node", "node_modules/@truefoundry/trueforge/dist/main.js"]
+CMD ["node", "dist/main.js"]

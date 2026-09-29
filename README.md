@@ -1,3 +1,9 @@
+---
+title: TrueForge
+sdk: docker
+app_port: 7860
+---
+
 <p align="center">
   <a href="https://trueforge.dev">
     <picture>
