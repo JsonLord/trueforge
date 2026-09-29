@@ -6,7 +6,7 @@
  * MCP OAuth callback in mcpOAuthRoutes.ts. `me` generates normally.
  */
 import { createRoute } from '@hono/zod-openapi';
-import { AuthLoginQuerySchema, GetMeResponseSchema, OAuthCallbackQuerySchema } from '../schemas/auth';
+import { AuthLoginQuerySchema, AuthStatusResponseSchema, GetMeResponseSchema, OAuthCallbackQuerySchema } from '../schemas/auth';
 import { RequestErrorResponseSchema } from '../schemas/errors';
 import { OpenApiTag } from './openapiTags';
 
@@ -53,6 +53,23 @@ export const authLogoutRoute = createRoute({
   'x-excluded': true,
   responses: {
     204: { description: 'Session cookie cleared.' },
+  },
+});
+
+export const authStatusRoute = createRoute({
+  method: 'get',
+  path: '/status',
+  tags: [OpenApiTag.AUTH],
+  summary: 'Authentication status and configuration',
+  description:
+    'Returns non-sensitive authentication status including public origin and callback path.',
+  'x-fern-sdk-group-name': ['auth'],
+  'x-fern-sdk-method-name': 'status',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: AuthStatusResponseSchema } },
+      description: 'Current authentication status and config.',
+    },
   },
 });
 

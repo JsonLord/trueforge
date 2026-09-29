@@ -442,16 +442,16 @@ function buildPostgresConnectionString(parts: {
 }
 
 function resolveOIDCConfig(): OIDCConfig | undefined {
-  const issuerUrl = getEnv('OIDC_ISSUER_URL');
-  const clientId = getEnv('OIDC_CLIENT_ID');
-  const clientSecret = getEnv('OIDC_CLIENT_SECRET');
+  const issuerUrl = getEnv('OIDC_ISSUER_URL') ?? getEnv('OAUTH_ISSUER_URL');
+  const clientId = getEnv('OIDC_CLIENT_ID') ?? getEnv('OAUTH_CLIENT_ID');
+  const clientSecret = getEnv('OIDC_CLIENT_SECRET') ?? getEnv('OAUTH_CLIENT_SECRET');
 
   if (!issuerUrl && !clientId && !clientSecret) {
     return undefined;
   }
   if (!issuerUrl || !clientId || !clientSecret) {
     throw new Error(
-      'OIDC_ISSUER_URL, OIDC_CLIENT_ID, and OIDC_CLIENT_SECRET must all be set together, or all left unset ' +
+      'OIDC_ISSUER_URL/OAUTH_ISSUER_URL, OIDC_CLIENT_ID/OAUTH_CLIENT_ID, and OIDC_CLIENT_SECRET/OAUTH_CLIENT_SECRET must all be set together, or all left unset ' +
         '(unset = fixed local admin identity, no IdP).',
     );
   }
@@ -631,10 +631,14 @@ export interface SharedServerConfiguration {
   /**
    * Public application URL (origin plus optional pathname). Used as the origin of
    * MCP OAuth and OIDC callbacks; the pathname is the UI/API public prefix when
-   * a reverse proxy strips it. Optional at boot; MCP OAuth and OIDC callback
-   * construction fail if empty outside standalone development. Env: `PUBLIC_BASE_URL`.
+   * a reverse proxy strips it. Env: `PUBLIC_APP_URL` or `PUBLIC_BASE_URL`.
    */
   PUBLIC_BASE_URL: string;
+  /**
+   * OIDC configuration for server authentication.
+   * Undefined means browser login is disabled.
+   */
+  OIDC: OIDCConfig | undefined;
   /**
    * Base URL the controller uses to reach the server's HTTP API. Dedicated controller
    * (`STANDALONE=false`, `dist/controller-main.js`) and the in-process standalone controller
@@ -909,7 +913,15 @@ const shared: SharedServerConfiguration = {
     raw: getEnv('REDIS_REQUEST_REPLY_POLL_INTERVAL_MS'),
     defaultValue: 500,
   }),
-  PUBLIC_BASE_URL: parsePublicBaseUrl(getEnv('PUBLIC_BASE_URL', { defaultValue: '' })),
+  PUBLIC_BASE_URL: parsePublicBaseUrl(
+    getEnv('PUBLIC_APP_URL') ??
+      getEnv('PUBLIC_BASE_URL') ??
+      getEnv('APP_URL') ??
+      getEnv('BASE_URL') ??
+      getEnv('PUBLIC_URL') ??
+      getEnv('OAUTH_REDIRECT_BASE_URL'),
+  ),
+  OIDC: resolveOIDCConfig(),
   SERVER_URL:
     getEnv('SERVER_URL', { defaultValue: `http://localhost:${String(port)}` }) ?? `http://localhost:${String(port)}`,
   TRUEFORGE_API_KEY: standalone
@@ -999,8 +1011,8 @@ const configuration: ServerConfiguration = standalone
 
 export function isOidcConfigured(
   value: ServerConfiguration,
-): value is DistributedServerConfiguration & { OIDC: OIDCConfig } {
-  return !value.STANDALONE && value.OIDC !== undefined;
+): value is ServerConfiguration & { OIDC: OIDCConfig } {
+  return value.OIDC !== undefined;
 }
 
 /**
@@ -1089,16 +1101,14 @@ if (!configuration.STANDALONE && configuration.TRUEFORGE_API_KEY.trim() === '') 
 }
 
 /**
- * Effective public application URL. Empty `PUBLIC_BASE_URL` stays empty
- * (callers that need a callback origin throw).
+ * Effective public application URL. Prefers `PUBLIC_BASE_URL` / `PUBLIC_APP_URL` if set;
+ * otherwise defaults to `http://localhost:$PORT`.
  */
 function effectivePublicBaseUrl(config: ServerConfiguration): string {
-  // Standalone production is one process on $PORT. Ignore a leftover Vite
-  // PUBLIC_BASE_URL (e.g. http://localhost:3000) from the shared .env.
-  if (config.STANDALONE && config.NODE_ENV !== 'development') {
-    return `http://localhost:${String(config.PORT)}`;
+  if (config.PUBLIC_BASE_URL && config.PUBLIC_BASE_URL.trim() !== '') {
+    return config.PUBLIC_BASE_URL;
   }
-  return config.PUBLIC_BASE_URL;
+  return `http://localhost:${String(config.PORT)}`;
 }
 
 /**

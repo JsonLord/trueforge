@@ -8,9 +8,9 @@ import { resolveRequestContext } from '../auth/identity';
 import { resolveOidcRequestContext } from '../auth/middleware';
 import { buildLoginAuthorization, exchangeAuthorizationCode } from '../auth/oidc';
 import { safeReturnTo } from '../auth/safeReturnTo';
-import { getPublicUiBasePath, isTrueFoundryModeEnabled } from '../config';
-import { authLoginRoute, authLogoutRoute, meRoute, oAuthCallbackRoute } from '../routes/authRoutes';
-import type { GetMeResponse } from '../schemas/auth';
+import { getPublicBaseUrl, getPublicUiBasePath, isTrueFoundryModeEnabled } from '../config';
+import { authLoginRoute, authLogoutRoute, authStatusRoute, meRoute, oAuthCallbackRoute } from '../routes/authRoutes';
+import type { AuthStatusResponse, GetMeResponse } from '../schemas/auth';
 import { resolveTrueFoundryLoginReturnTo } from '../truefoundry/externalLogin';
 
 /** Login / OIDC failures land on the public UI home with `?error=<reason>`. */
@@ -54,6 +54,8 @@ export function createAuthRouter(params: {
 
     if (params.oidcClient) {
       try {
+        const redirectUri = `${getPublicBaseUrl()}/api/v1/auth/callback`;
+        params.logger.info('OAuth login initiated', { redirect_uri: redirectUri });
         const authorizationUrl = await buildLoginAuthorization({
           context: c,
           client: params.oidcClient,
@@ -125,6 +127,30 @@ export function createAuthRouter(params: {
       const reason = error instanceof Error ? error.message : 'login_failed';
       return c.redirect(oauthErrorRedirect(reason), 302);
     }
+  });
+
+  router.openapi(authStatusRoute, async c => {
+    let authenticated = false;
+    try {
+      if (await resolveOidcRequestContext(c)) {
+        authenticated = true;
+      }
+    } catch {
+      authenticated = false;
+    }
+    const publicOrigin = getPublicBaseUrl();
+    const callbackPath = '/api/v1/auth/callback';
+    const authEnabled = params.oidcClient !== undefined;
+    const body: AuthStatusResponse = {
+      data: {
+        authenticated,
+        auth_enabled: authEnabled,
+        public_origin: publicOrigin,
+        callback_path: callbackPath,
+        callback_url: `${publicOrigin}${callbackPath}`,
+      },
+    };
+    return c.json(body, 200);
   });
 
   router.openapi(authLogoutRoute, c => {
