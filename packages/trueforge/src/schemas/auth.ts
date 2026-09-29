@@ -54,4 +54,18 @@ export const GetMeResponseSchema = z.object({ data: MeSchema }).openapi('GetMeRe
 export type GetMeSubject = z.infer<typeof GetMeSubjectSchema>;
 export type MeSessionType = z.infer<typeof MeSessionTypeSchema>;
 export type Me = z.infer<typeof MeSchema>;
+export const AuthStatusSchema = z
+  .object({
+    authenticated: z.boolean().describe('Whether the current caller is authenticated.'),
+    auth_enabled: z.boolean().describe('Whether browser OIDC login is enabled.'),
+    public_origin: z.string().describe('Canonical public origin for the application.'),
+    callback_path: z.string().describe('OAuth callback path.'),
+    callback_url: z.string().describe('Full OAuth redirect URI.'),
+  })
+  .openapi('AuthStatus');
+
+export const AuthStatusResponseSchema = z.object({ data: AuthStatusSchema }).openapi('AuthStatusResponse');
+
 export type GetMeResponse = z.infer<typeof GetMeResponseSchema>;
+export type AuthStatus = z.infer<typeof AuthStatusSchema>;
+export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;

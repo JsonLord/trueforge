@@ -102,6 +102,22 @@ To work on TrueForge from this repository, see [CONTRIBUTING.md](CONTRIBUTING.md
 | [Chat UI](https://trueforge.dev/chat-ui)                            | Bundled UI and embedding `@truefoundry/trueforge-ui`              |
 | [API Reference](https://trueforge.dev/api-reference)                | OpenAPI paths and schemas                                         |
 
+## Hugging Face Space Authentication & Provider Configuration
+
+When deploying on Hugging Face Spaces (e.g. `Leon4gr45/xu`), configure your OAuth provider with the exact redirect URI:
+
+- **Application / Home URL:** `https://leon4gr45-xu.hf.space/`
+- **Authorization Callback / Redirect URI:** `https://leon4gr45-xu.hf.space/api/v1/auth/callback`
+
+> **Note:** OAuth providers perform exact string matching. `https://leon4gr45-xu.hf.space/` and `https://leon4gr45-xu.hf.space/api/v1/auth/callback` are NOT interchangeable. Ensure the callback path `/api/v1/auth/callback` is registered exactly in your OAuth provider settings.
+
+### Required Space Variables & Secrets
+
+- `PUBLIC_APP_URL`: `https://leon4gr45-xu.hf.space`
+- `OAUTH_CLIENT_ID`: `<OAuth Client ID secret>`
+- `OAUTH_CLIENT_SECRET`: `<OAuth Client Secret secret>`
+- `OAUTH_ISSUER_URL`: `<OIDC/OAuth Issuer URL secret>`
+
 ## Benchmarks
 
 We compare TrueForge against Claude Managed Agents and deepagents on the same tasks, tools, and model - same accuracy, lower cost. Reproduce it from [`benchmark/`](benchmark/). Write-up: [Benchmarking](https://trueforge.dev/benchmarking).

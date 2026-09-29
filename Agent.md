@@ -38,11 +38,27 @@ This document provides instructions, tricks, and best practices for deploying Tr
 - **`/health`**: Returns HTTP 200 OK JSON (`{ "status": "ok", "version": "..." }`) required for Hugging Face Space health checks to transition state from *starting* -> *running*.
 - **`/api-docs`**: Interactive OpenAPI Swagger UI documentation, reachable at `https://leon4gr45-xu.hf.space/api-docs`.
 
+### Authentication & Provider Configuration
+
+#### Canonical URLs
+- **Application / Home URL:** `https://leon4gr45-xu.hf.space/`
+- **Authorization Callback / Redirect URI:** `https://leon4gr45-xu.hf.space/api/v1/auth/callback`
+
+> **Note on OAuth Redirect URI Matching:** OAuth providers perform exact string matching. The registered URI must match `https://leon4gr45-xu.hf.space/api/v1/auth/callback` exactly. Do not register `https://leon4gr45-xu.hf.space/` or `http://...` as the callback URI.
+
+#### Required Hugging Face Space Secrets & Variables
+- `PUBLIC_APP_URL`: `https://leon4gr45-xu.hf.space`
+- `OAUTH_CLIENT_ID`: `<OAuth Client ID secret>`
+- `OAUTH_CLIENT_SECRET`: `<OAuth Client Secret secret>`
+- `OAUTH_ISSUER_URL`: `<OIDC/OAuth Issuer URL secret>` (e.g. `https://accounts.google.com` or Okta issuer)
+
 ### Functional Endpoints
 - **`/api/v1/openapi.json`**: GET - Returns the OpenAPI 3.1 specification JSON.
 - **`/api/v1/docs`**: GET - Interactive OpenAPI documentation UI.
+- **`/api/v1/auth/status`**: GET - Non-sensitive authentication status (`authenticated`, `public_origin`, `callback_path`, `callback_url`).
 - **`/api/v1/auth/me`**: GET - Returns current session identity and auth mode.
-- **`/api/v1/auth/login`**: GET - Redirects to browser login / auth flow.
+- **`/api/v1/auth/login`**: GET - Redirects to browser login / OAuth authorization.
+- **`/api/v1/auth/callback`**: GET - OAuth provider redirect callback target.
 - **`/api/v1/models`**: GET / POST / PUT / DELETE - Manages model provider configurations.
 - **`/api/v1/agents`**: GET / POST / PUT / DELETE - Manages agents.
 - **`/api/v1/sessions`**: GET / POST / DELETE - Manages agent sessions and execution turns.

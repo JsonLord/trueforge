@@ -98,6 +98,23 @@ describe('auth router (no identity provider configured)', () => {
     expect(res.status).toBe(204);
   });
 
+  it('GET /auth/status returns non-sensitive config when auth is disabled', async () => {
+    const router = createTestAuthRouter({ oidcClient: undefined });
+
+    const res = await router.request('/status');
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      data: {
+        authenticated: false,
+        auth_enabled: false,
+        public_origin: 'https://harness.example.com',
+        callback_path: '/api/v1/auth/callback',
+        callback_url: 'https://harness.example.com/api/v1/auth/callback',
+      },
+    });
+  });
+
   it('GET /auth/me returns the standalone identity when auth is disabled', async () => {
     const router = createTestAuthRouter({ oidcClient: undefined });
 
