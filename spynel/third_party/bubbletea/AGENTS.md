@@ -1,0 +1,20 @@
+# Bubble Tea Local Dependency DOX
+
+## Purpose
+
+- Own the MIT-licensed Bubble Tea v1.3.10 root Go package and upstream tests, selected by the root module's `replace` directive. Upstream tag commit: `9edf69c677c7353eca5fae6d3ea3986af39717b7` at https://github.com/charmbracelet/bubbletea/tree/v1.3.10.
+
+## Local Contracts
+
+- Keep upstream source, tests, module metadata and LICENSE intact except for the documented terminal output/exit fixes and complete-key decoding adapter. Examples, upstream automation and README are omitted.
+- The terminal ownership patch discovers `ttyOutput` in `NewProgram` after options/default output are resolved, before any resize reader starts; Unix and Windows `initInput` no longer reassign it. `ReleaseTerminal`/`RestoreTerminal`, Exec and SIGWINCH share this immutable descriptor. Preserve raw-mode, initial-size and nil-renderer behavior.
+- The shared renderer `exitAltScreen` resets styles and clears visible alternate-screen cells before switching to the normal screen, under the flush mutex. Shutdown and Exec release stop/flush (or cancel) the renderer first; no caller may clear after restoring the shell or erase saved lines. Preserve normal-screen output, diagnostics, input restoration and nil-renderer behavior. The real TUI PTY/cell replay covers Ctrl+C, /quit, context cancellation and quitting after repeated F6/resize.
+- `ClearScreen` re-establishes an owned alternate screen through the existing clear/exit/enter operations under one flush lock. Callers must not split this restoration across asynchronous commands: a flush between them renders the application into normal-screen history. Keep the owning renderer check and the TUI's delayed-command regression.
+- Signal delivery uses context-aware `Program.Send` so SIGINT/SIGTERM cannot block the shutdown handler join when an external context independently ends the event loop. `signal_cancel_linux_test.go` observes blocked dispatch before cancellation for both signals; preserve that barrier and the real TUI SIGTERM/PTY exit check.
+- `DecodeKey` exposes the existing Program decoder for an already framed complete event; Spynel owns framing and Escape timing. The static terminal-copy path uses this adapter instead of maintaining a second function-key table. Keep upstream key semantics unchanged and retain the table-parity regression.
+- This local module avoids editing the shared module cache or adding caller timing workarounds. Remove the replacement when an adopted upstream version fixes these terminal ownership/exit boundaries and exposes equivalent key decoding; a v2 migration is outside this fix.
+- Run `go test -race github.com/charmbracelet/bubbletea` and the real Spynel PTY regression from the repository root. `scripts/dev.sh test` includes this dependency's tests and vet because `./...` skips nested modules. `tty_race_linux_test.go` is the local owning-layer regression; the full application PTY verifies actual raw startup, F6 restore and SIGWINCH.
+
+## Child DOX Index
+
+No child DOX files.

@@ -1,0 +1,1014 @@
+package harness
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
+)
+
+type CodexConfig struct {
+	Command        string
+	Cwd            string
+	Model          string
+	Effort         string
+	ServiceMode    string
+	ApprovalPolicy string
+	Sandbox        string
+	Network        bool
+	SessionsFile   string
+	Version        string
+	Stderr         io.Writer
+}
+
+type Codex struct {
+	config CodexConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+
+	writeMu sync.Mutex
+	// ponytail: one app-server stream serializes callbacks; use per-thread
+	// dispatch only if slow callbacks measurably limit throughput.
+	eventMu  sync.Mutex
+	keyMu    sync.Mutex
+	keyLocks map[string]*sync.Mutex
+	mu       sync.Mutex
+	nextID   int
+	pending  map[int]codexPendingCall
+	session  map[string]string
+	loaded   map[string]bool
+	active   map[string]*turnState
+	deferred map[string][]wireMessage
+	closed   bool
+	failure  error
+}
+
+func (*Codex) FollowUpMode() FollowUpMode { return FollowUpSteer }
+
+// Available reports the transport state, not merely whether a process was
+// constructed. The owning supervisor publishes readiness after replacement.
+func (c *Codex) Available() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failure != nil {
+		return false, c.failure.Error()
+	}
+	if c.closed || c.stdin == nil {
+		return false, "Codex app-server is not running"
+	}
+	return true, ""
+}
+
+func (*Codex) ReadyEvents() <-chan struct{} { return nil }
+
+type turnState struct {
+	key              string
+	threadID         string
+	turnID           string
+	deliveryMu       sync.Mutex
+	completed        bool
+	emitMu           sync.RWMutex
+	emit             core.Emit
+	messages         []string
+	currentMessage   strings.Builder
+	separatorPending bool
+	reconnecting     bool
+}
+
+func (s *turnState) emitEvent(event core.Event) {
+	s.emitMu.RLock()
+	emit := s.emit
+	s.emitMu.RUnlock()
+	if emit != nil {
+		emit(event)
+	}
+}
+
+func (s *turnState) replaceEmit(emit core.Emit) core.Emit {
+	s.emitMu.Lock()
+	previous := s.emit
+	s.emit = emit
+	s.emitMu.Unlock()
+	return previous
+}
+
+type rpcResponse struct {
+	Result json.RawMessage
+	Error  *rpcError
+}
+
+type codexPendingCall struct {
+	method   string
+	response chan rpcResponse
+}
+
+type rpcError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+type rpcCallError struct {
+	Method  string
+	Code    int
+	Message string
+}
+
+func (e *rpcCallError) Error() string {
+	if e.Code == -32601 {
+		return fmt.Sprintf("Codex app-server is incompatible: required method %q is unavailable: %s (%d); update the Codex executable or select another harness", e.Method, e.Message, e.Code)
+	}
+	return fmt.Sprintf("Codex app-server method %q failed: %s (%d)", e.Method, e.Message, e.Code)
+}
+
+type codexModelList struct {
+	Data []struct {
+		ID                     string `json:"id"`
+		Model                  string `json:"model"`
+		DisplayName            string `json:"displayName"`
+		DefaultReasoningEffort string `json:"defaultReasoningEffort"`
+		SupportedEfforts       []struct {
+			Effort      string `json:"reasoningEffort"`
+			Description string `json:"description"`
+		} `json:"supportedReasoningEfforts"`
+		ServiceTiers []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"serviceTiers"`
+		DefaultServiceTier *string `json:"defaultServiceTier"`
+		IsDefault          bool    `json:"isDefault"`
+	} `json:"data"`
+	NextCursor *string `json:"nextCursor"`
+}
+
+type wireMessage struct {
+	ID     json.RawMessage `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *rpcError       `json:"error,omitempty"`
+}
+
+func NewCodex(cfg CodexConfig) (*Codex, error) {
+	if cfg.Command == "" {
+		cfg.Command = "codex"
+	}
+	if cfg.Cwd == "" {
+		cfg.Cwd = "."
+	}
+	if cfg.ApprovalPolicy == "" {
+		cfg.ApprovalPolicy = "never"
+	}
+	if cfg.Sandbox == "" {
+		cfg.Sandbox = "dangerFullAccess"
+	}
+	c := &Codex{
+		config: cfg, nextID: 1, pending: map[int]codexPendingCall{}, session: map[string]string{},
+		loaded: map[string]bool{}, active: map[string]*turnState{}, deferred: map[string][]wireMessage{},
+		keyLocks: map[string]*sync.Mutex{},
+	}
+	if err := c.loadSessions(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Models uses Codex app-server's picker-visible model catalog instead of a
+// static list, so account-specific availability and future models are honored.
+func (c *Codex) Models(ctx context.Context) ([]Model, error) {
+	var models []Model
+	var cursor string
+	for {
+		params := map[string]any{"limit": 100, "includeHidden": false}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		result, err := c.call(ctx, "model/list", params)
+		if err != nil {
+			return nil, fmt.Errorf("list Codex models: %w", err)
+		}
+		var page codexModelList
+		if err := json.Unmarshal(result, &page); err != nil {
+			return nil, fmt.Errorf("decode Codex model catalog: %w", err)
+		}
+		for _, item := range page.Data {
+			id := item.Model
+			if id == "" {
+				id = item.ID
+			}
+			if id == "" {
+				continue
+			}
+			model := Model{ID: id, DisplayName: item.DisplayName, DefaultEffort: item.DefaultReasoningEffort, Default: item.IsDefault}
+			if model.DisplayName == "" {
+				model.DisplayName = id
+			}
+			for _, effort := range item.SupportedEfforts {
+				model.Efforts = append(model.Efforts, effort.Effort)
+			}
+			for _, tier := range item.ServiceTiers {
+				model.ServiceModes = append(model.ServiceModes, ModelPropertyOption{ID: tier.ID, DisplayName: tier.Name, Description: tier.Description})
+			}
+			if item.DefaultServiceTier != nil {
+				model.DefaultServiceMode = *item.DefaultServiceTier
+			}
+			models = append(models, model)
+		}
+		if page.NextCursor == nil || *page.NextCursor == "" {
+			break
+		}
+		cursor = *page.NextCursor
+	}
+	return models, nil
+}
+
+func (c *Codex) Start(parent context.Context) error {
+	c.mu.Lock()
+	if c.cmd != nil {
+		c.mu.Unlock()
+		return nil
+	}
+	c.ctx, c.cancel = context.WithCancel(parent)
+	c.cmd = exec.CommandContext(c.ctx, c.config.Command, "app-server", "--stdio")
+	c.cmd.Dir = c.config.Cwd
+	stdout, err := c.cmd.StdoutPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	stdin, err := c.cmd.StdinPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.stdin = stdin
+	if c.config.Stderr != nil {
+		c.cmd.Stderr = c.config.Stderr
+	}
+	if err := c.cmd.Start(); err != nil {
+		c.cmd = nil
+		c.mu.Unlock()
+		return fmt.Errorf("start codex app-server: %w", err)
+	}
+	c.mu.Unlock()
+	go c.readLoop(stdout)
+	go c.waitLoop()
+
+	params := map[string]any{
+		"clientInfo":   map[string]any{"name": "spynel", "title": "Spynel", "version": c.config.Version},
+		"capabilities": map[string]any{"experimentalApi": false},
+	}
+	result, err := c.call(parent, "initialize", params)
+	if err != nil {
+		_ = c.Close()
+		return fmt.Errorf("Codex executable %q failed app-server initialization: %w", c.config.Command, err)
+	}
+	var initialized map[string]json.RawMessage
+	if err := json.Unmarshal(result, &initialized); err != nil || initialized == nil {
+		_ = c.Close()
+		return fmt.Errorf("Codex executable %q returned an incompatible initialize result; expected the documented app-server object", c.config.Command)
+	}
+	return c.notify("initialized", map[string]any{})
+}
+
+func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	selection := InferenceSelection{Model: c.config.Model, Effort: c.config.Effort, ServiceMode: c.config.ServiceMode}
+	c.mu.Unlock()
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (c *Codex) SetModel(model string) {
+	c.mu.Lock()
+	c.config.Model = model
+	c.mu.Unlock()
+}
+
+func (c *Codex) SetInference(selection InferenceSelection) {
+	c.mu.Lock()
+	c.config.Model, c.config.Effort, c.config.ServiceMode = selection.Model, selection.Effort, selection.ServiceMode
+	c.mu.Unlock()
+}
+
+func (c *Codex) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	selection := InferenceSelection{Model: model, Effort: c.config.Effort, ServiceMode: c.config.ServiceMode}
+	c.mu.Unlock()
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", false, errors.New("harness prompt is empty")
+	}
+	var models []Model
+	if selection.ServiceMode != "" {
+		var err error
+		models, err = c.Models(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("validate Codex inference properties: %w", err)
+		}
+	}
+	if err := ValidateInferenceSelection(models, selection); err != nil {
+		return "", false, err
+	}
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	threadID, err := c.ensureThread(ctx, key, selection.Model)
+	if err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	active := c.active[threadID]
+	c.mu.Unlock()
+	if active != nil {
+		previousEmit := active.replaceEmit(emit)
+		params := map[string]any{
+			"threadId":       threadID,
+			"expectedTurnId": active.turnID,
+			"input":          []map[string]any{{"type": "text", "text": prompt}},
+		}
+		if _, err := c.call(ctx, "turn/steer", params); err != nil {
+			c.mu.Lock()
+			stillActive := c.active[threadID] == active
+			c.mu.Unlock()
+			if stillActive {
+				active.replaceEmit(previousEmit)
+			}
+			return threadID, true, err
+		}
+		// The newest message owns the rest of the streamed response. Release
+		// transport-local activity associated with the older message without
+		// declaring the underlying harness turn complete.
+		if previousEmit != nil {
+			previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
+		}
+		if emit != nil {
+			emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
+		}
+		return threadID, true, nil
+	}
+
+	params := map[string]any{
+		"threadId":       threadID,
+		"input":          []map[string]any{{"type": "text", "text": prompt}},
+		"cwd":            c.config.Cwd,
+		"approvalPolicy": c.config.ApprovalPolicy,
+		"sandboxPolicy":  c.sandboxPolicy(),
+	}
+	if selection.Model != "" {
+		params["model"] = selection.Model
+	}
+	if selection.Effort != "" {
+		params["effort"] = selection.Effort
+	}
+	if selection.ServiceMode != "" {
+		params["serviceTier"] = selection.ServiceMode
+	}
+	result, err := c.call(ctx, "turn/start", params)
+	if err != nil {
+		return threadID, false, fmt.Errorf("start Codex turn with required method turn/start: %w", err)
+	}
+	var response struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		return threadID, false, fmt.Errorf("Codex app-server returned an incompatible turn/start result: decode required field turn.id: %w", err)
+	}
+	if response.Turn.ID == "" {
+		return threadID, false, errors.New("Codex app-server returned an incompatible turn/start result: required field turn.id is missing")
+	}
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.mu.Lock()
+	failure, closed := c.failure, c.closed
+	c.mu.Unlock()
+	if failure != nil {
+		return threadID, false, failure
+	}
+	if closed {
+		return threadID, false, errors.New("codex app-server is not running")
+	}
+	state := &turnState{key: key, threadID: threadID, turnID: response.Turn.ID, emit: emit}
+	// Publish admission before replaying any provider error/recovery events.
+	state.emitEvent(core.Event{Kind: core.EventStatus, Text: "Codex turn started", ThreadID: threadID, TurnID: response.Turn.ID,
+		Execution: &core.ExecutionStatus{State: "running"}})
+	c.mu.Lock()
+	c.active[threadID] = state
+	deferred := c.deferred[response.Turn.ID]
+	delete(c.deferred, response.Turn.ID)
+	c.mu.Unlock()
+	for _, message := range deferred {
+		c.handleNotificationLocked(message)
+	}
+	return threadID, false, nil
+}
+
+// Steer addresses only the current turn and cannot fall back to turn/start.
+func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", errors.New("harness prompt is empty")
+	}
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	c.mu.Lock()
+	threadID := c.session[key]
+	active := c.active[threadID]
+	c.mu.Unlock()
+	if threadID == "" || active == nil {
+		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
+	}
+	active.deliveryMu.Lock()
+	if active.completed {
+		active.deliveryMu.Unlock()
+		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
+	}
+	if beforeDelivery != nil && !beforeDelivery() {
+		active.deliveryMu.Unlock()
+		return threadID, errNativeDeliveryUnreserved
+	}
+	previousEmit := active.replaceEmit(emit)
+	params := map[string]any{
+		"threadId": threadID, "expectedTurnId": active.turnID,
+		"input": []map[string]any{{"type": "text", "text": prompt}},
+	}
+	id, response, err := c.beginCall("turn/steer", params)
+	active.deliveryMu.Unlock()
+	if err == nil {
+		_, err = c.awaitCall(ctx, "turn/steer", id, response)
+	}
+	if err != nil {
+		c.mu.Lock()
+		stillActive := c.active[threadID] == active
+		c.mu.Unlock()
+		if stillActive {
+			active.replaceEmit(previousEmit)
+		}
+		return threadID, err
+	}
+	if previousEmit != nil {
+		previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
+	}
+	if emit != nil {
+		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
+	}
+	return threadID, nil
+}
+
+func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, error) {
+	c.mu.Lock()
+	threadID := c.session[key]
+	loaded := c.loaded[threadID]
+	c.mu.Unlock()
+	if threadID != "" && loaded {
+		return threadID, nil
+	}
+	if threadID != "" {
+		// Codex retains the full conversation internally. Spynel needs only
+		// its identity; returning the history can overflow the shared stream.
+		result, err := c.call(ctx, "thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true})
+		if err != nil {
+			var callErr *rpcCallError
+			if errors.As(err, &callErr) && callErr.Code == -32601 {
+				return "", fmt.Errorf("cannot safely resume persisted Codex thread %q: required method thread/resume is unavailable: %w", threadID, err)
+			}
+			return "", fmt.Errorf("cannot safely resume persisted Codex thread: %w", err)
+		} else {
+			var response struct {
+				Thread struct {
+					ID string `json:"id"`
+				} `json:"thread"`
+			}
+			if decodeErr := json.Unmarshal(result, &response); decodeErr != nil || response.Thread.ID == "" {
+				return "", fmt.Errorf("cannot safely resume persisted Codex thread %q: incompatible thread/resume result missing required field thread.id", threadID)
+			}
+			c.mu.Lock()
+			c.loaded[response.Thread.ID] = true
+			c.mu.Unlock()
+			return response.Thread.ID, nil
+		}
+	}
+	params := map[string]any{
+		"cwd":            c.config.Cwd,
+		"approvalPolicy": c.config.ApprovalPolicy,
+		"sandbox":        c.threadSandbox(),
+		"serviceName":    "spynel",
+	}
+	if model != "" {
+		params["model"] = model
+	}
+	result, err := c.call(ctx, "thread/start", params)
+	if err != nil {
+		return "", fmt.Errorf("start Codex session with required method thread/start: %w", err)
+	}
+	var response struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		return "", fmt.Errorf("Codex app-server returned an incompatible thread/start result: decode required field thread.id: %w", err)
+	}
+	if response.Thread.ID == "" {
+		return "", errors.New("Codex app-server returned an incompatible thread/start result: required field thread.id is missing")
+	}
+	c.mu.Lock()
+	c.session[key] = response.Thread.ID
+	c.loaded[response.Thread.ID] = true
+	err = c.saveSessionsLocked()
+	c.mu.Unlock()
+	return response.Thread.ID, err
+}
+
+func (c *Codex) sandboxPolicy() map[string]any {
+	sandbox := c.threadSandbox()
+	typeName := "workspaceWrite"
+	if sandbox == "read-only" {
+		typeName = "readOnly"
+	} else if sandbox == "danger-full-access" {
+		typeName = "dangerFullAccess"
+	}
+	result := map[string]any{"type": typeName}
+	if sandbox == "workspace-write" {
+		result["writableRoots"] = []string{c.config.Cwd}
+		result["networkAccess"] = c.config.Network
+	}
+	return result
+}
+
+func (c *Codex) threadSandbox() string {
+	switch c.config.Sandbox {
+	case "readOnly", "read-only":
+		return "read-only"
+	case "dangerFullAccess", "danger-full-access":
+		return "danger-full-access"
+	default:
+		return "workspace-write"
+	}
+}
+
+func (c *Codex) ThreadID(key string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session[key]
+}
+
+func (c *Codex) IsActive(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	threadID := c.session[key]
+	return c.active[threadID] != nil
+}
+
+func (c *Codex) Interrupt(ctx context.Context, key string) (bool, error) {
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	c.mu.Lock()
+	threadID := c.session[key]
+	state := c.active[threadID]
+	c.mu.Unlock()
+	if state == nil {
+		return false, nil
+	}
+	_, err := c.call(ctx, "turn/interrupt", map[string]any{
+		"threadId": state.threadID,
+		"turnId":   state.turnID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Codex) ResetSession(key string) error {
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if threadID := c.session[key]; threadID != "" && c.active[threadID] != nil {
+		return errors.New("cannot reset a session while its turn is active")
+	}
+	delete(c.session, key)
+	return c.saveSessionsLocked()
+}
+
+func (c *Codex) lockForKey(key string) *sync.Mutex {
+	c.keyMu.Lock()
+	defer c.keyMu.Unlock()
+	lock := c.keyLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.keyLocks[key] = lock
+	}
+	return lock
+}
+
+func (c *Codex) handleNotification(message wireMessage) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.handleNotificationLocked(message)
+}
+
+// eventMu spans state changes and callbacks, including admission's replay.
+// Keep mu free during callbacks so inspection and RPC replies can proceed.
+func (c *Codex) handleNotificationLocked(message wireMessage) {
+	var params map[string]any
+	if json.Unmarshal(message.Params, &params) != nil {
+		return
+	}
+	threadID, _ := params["threadId"].(string)
+	turnID, _ := params["turnId"].(string)
+	if turn, ok := params["turn"].(map[string]any); ok {
+		if id, ok := turn["id"].(string); ok {
+			turnID = id
+		}
+	}
+	c.mu.Lock()
+	if c.failure != nil || c.closed {
+		c.mu.Unlock()
+		return
+	}
+	state := c.active[threadID]
+	if state == nil && turnID != "" {
+		for _, candidate := range c.active {
+			if candidate.turnID == turnID {
+				state = candidate
+				threadID = candidate.threadID
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	if state == nil {
+		if turnID != "" {
+			c.mu.Lock()
+			c.deferred[turnID] = append(c.deferred[turnID], message)
+			c.mu.Unlock()
+		}
+		return
+	}
+	if turnID != state.turnID {
+		return
+	}
+	// Only fresh model output for this turn establishes upstream recovery.
+	// Tool output, item completion, and generic activity may arrive during a retry.
+	if state.reconnecting {
+		switch message.Method {
+		case "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/plan/delta":
+			if delta, _ := params["delta"].(string); delta != "" {
+				state.reconnecting = false
+				state.emitEvent(core.Event{Kind: core.EventStatus, ThreadID: state.threadID, TurnID: state.turnID,
+					Execution: &core.ExecutionStatus{State: "running"}})
+			}
+		}
+	}
+	switch message.Method {
+	case "item/agentMessage/delta":
+		delta, _ := params["delta"].(string)
+		if delta != "" {
+			if state.separatorPending {
+				state.emitEvent(core.Event{Kind: core.EventDelta, Text: "\n", ThreadID: state.threadID, TurnID: state.turnID})
+			}
+			state.emitEvent(core.Event{Kind: core.EventDelta, Text: delta, ThreadID: state.threadID, TurnID: state.turnID})
+			state.separatorPending = false
+			state.currentMessage.WriteString(delta)
+		}
+	case "item/completed":
+		item, _ := params["item"].(map[string]any)
+		if item["type"] == "agentMessage" {
+			text, _ := item["text"].(string)
+			if text == "" {
+				text = state.currentMessage.String()
+			}
+			if text != "" {
+				state.messages = append(state.messages, text)
+				state.separatorPending = true
+			}
+			state.currentMessage.Reset()
+		}
+	case "error":
+		errorObject, _ := params["error"].(map[string]any)
+		text, _ := errorObject["message"].(string)
+		state.reconnecting, _ = params["willRetry"].(bool)
+		kind, execution := core.EventError, "error"
+		if state.reconnecting {
+			kind, execution = core.EventStatus, "reconnecting"
+		}
+		state.emitEvent(core.Event{Kind: kind, Text: text, ThreadID: state.threadID, TurnID: state.turnID,
+			Execution: &core.ExecutionStatus{State: execution, Detail: text}})
+	case "turn/completed":
+		state.deliveryMu.Lock()
+		state.completed = true
+		state.deliveryMu.Unlock()
+		turn, _ := params["turn"].(map[string]any)
+		status, _ := turn["status"].(string)
+		messages := append([]string(nil), state.messages...)
+		if text := state.currentMessage.String(); text != "" {
+			messages = append(messages, text)
+		}
+		text := strings.Join(messages, "\n")
+		finalText := ""
+		if len(messages) > 0 {
+			finalText = messages[len(messages)-1]
+		}
+		kind := core.EventFinal
+		if status == "failed" {
+			kind = core.EventError
+			if errObject, ok := turn["error"].(map[string]any); ok {
+				if message, ok := errObject["message"].(string); ok && message != "" {
+					text = message
+				}
+			}
+			finalText = text
+		} else if status != "completed" && status != "interrupted" {
+			kind = core.EventError
+			text = fmt.Sprintf("Codex app-server returned incompatible terminal status %q; expected completed, interrupted, or failed", status)
+			finalText = text
+		}
+		execution := &core.ExecutionStatus{State: "finishing"}
+		if kind == core.EventError {
+			execution = &core.ExecutionStatus{State: "error", Detail: text}
+		}
+		c.mu.Lock()
+		delete(c.active, state.threadID)
+		c.mu.Unlock()
+		state.emitEvent(core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: state.threadID, TurnID: state.turnID, Done: true, Execution: execution})
+	default:
+		// Keep internal tool and lifecycle method names out of user-facing status.
+	}
+}
+
+func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id, response, err := c.beginCall(method, params)
+	if err != nil {
+		return nil, err
+	}
+	return c.awaitCall(ctx, method, id, response)
+}
+
+func (c *Codex) beginCall(method string, params any) (int, chan rpcResponse, error) {
+	c.mu.Lock()
+	if c.failure != nil {
+		failure := c.failure
+		c.mu.Unlock()
+		return 0, nil, failure
+	}
+	if c.closed || c.stdin == nil {
+		c.mu.Unlock()
+		return 0, nil, errors.New("codex app-server is not running")
+	}
+	id := c.nextID
+	c.nextID++
+	response := make(chan rpcResponse, 1)
+	c.pending[id] = codexPendingCall{method: method, response: response}
+	c.mu.Unlock()
+	if err := c.write(map[string]any{"id": id, "method": method, "params": params}); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+	return id, response, nil
+}
+
+func (c *Codex) awaitCall(ctx context.Context, method string, id int, response chan rpcResponse) (json.RawMessage, error) {
+	select {
+	case result := <-response:
+		if result.Error != nil {
+			return nil, &rpcCallError{Method: method, Code: result.Error.Code, Message: result.Error.Message}
+		}
+		return result.Result, nil
+	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+func (c *Codex) notify(method string, params any) error {
+	return c.write(map[string]any{"method": method, "params": params})
+}
+
+func (c *Codex) write(message any) error {
+	data, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	stdin := c.stdin
+	c.mu.Unlock()
+	if stdin == nil {
+		return errors.New("codex app-server stdin is closed")
+	}
+	_, err = stdin.Write(append(data, '\n'))
+	return err
+}
+
+func (c *Codex) readLoop(reader io.Reader) {
+	const maxMessage = 16 * 1024 * 1024
+	oversized := "message (header unavailable)"
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), maxMessage)
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if len(data) >= maxMessage && bytes.IndexByte(data, '\n') < 0 {
+			oversized = c.describeFrame(data[:min(len(data), 4096)])
+		}
+		return bufio.ScanLines(data, atEOF)
+	})
+	for scanner.Scan() {
+		var message wireMessage
+		if json.Unmarshal(scanner.Bytes(), &message) != nil {
+			continue
+		}
+		if len(message.ID) > 0 && message.Method == "" {
+			id, err := strconv.Atoi(strings.Trim(string(message.ID), "\""))
+			if err != nil {
+				continue
+			}
+			c.mu.Lock()
+			waiter := c.pending[id]
+			delete(c.pending, id)
+			c.mu.Unlock()
+			if waiter.response != nil {
+				waiter.response <- rpcResponse{Result: message.Result, Error: message.Error}
+			}
+			continue
+		}
+		if len(message.ID) > 0 && message.Method != "" {
+			// Spynel defaults to non-interactive approval policy. Decline any
+			// unexpected server request instead of granting hidden authority.
+			_ = c.write(map[string]any{"id": json.RawMessage(message.ID), "result": "decline"})
+			continue
+		}
+		if message.Method != "" {
+			c.handleNotification(message)
+		}
+	}
+	err := scanner.Err()
+	if errors.Is(err, bufio.ErrTooLong) {
+		err = fmt.Errorf("Codex app-server %s exceeds the 16 MiB transport limit; connection stopped; use /restart to reconnect (interrupted requests are not replayed)", oversized)
+	} else if err == nil {
+		err = io.EOF
+	}
+	c.failAll(fmt.Errorf("codex app-server stream closed: %w", err))
+}
+
+// Inspect only the bounded envelope prefix. Never put payloads, provider IDs,
+// or arbitrary strings into diagnostics, even for malformed protocol output.
+func (c *Codex) describeFrame(prefix []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(prefix))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return "message (header unavailable)"
+	}
+	key, err := decoder.Token()
+	if err == nil {
+		switch key {
+		case "method":
+			var method string
+			if decoder.Decode(&method) != nil {
+				break
+			}
+			switch method {
+			case "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/plan/delta",
+				"item/started", "item/completed", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+				"thread/started", "turn/started", "turn/completed", "turn/diff/updated", "error",
+				"codex/event/raw_response_item", "codex/event/session_configured", "codex/event/exec_command_end", "codex/event/mcp_tool_call_end":
+				return "notification " + method
+			}
+			return "notification (unrecognized method)"
+		case "id":
+			var id json.Number
+			if decoder.Decode(&id) != nil {
+				break
+			}
+			number, err := strconv.Atoi(string(id))
+			if err != nil {
+				break
+			}
+			c.mu.Lock()
+			call := c.pending[number]
+			c.mu.Unlock()
+			if call.method != "" {
+				return "response to " + call.method
+			}
+			return "response (request no longer pending)"
+		default:
+			// The body may itself be huge. Do not decode it to find a header.
+			return "message (header unavailable)"
+		}
+	}
+	return "message (header unavailable)"
+}
+
+func (c *Codex) waitLoop() {
+	c.mu.Lock()
+	cmd := c.cmd
+	c.mu.Unlock()
+	if cmd == nil {
+		return
+	}
+	err := cmd.Wait()
+	if err == nil {
+		err = errors.New("codex app-server exited")
+	}
+	c.failAll(err)
+}
+
+func (c *Codex) failAll(err error) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.mu.Lock()
+	if c.closed || c.failure != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.failure = err
+	pending := c.pending
+	active := c.active
+	c.pending = map[int]codexPendingCall{}
+	c.active = map[string]*turnState{}
+	c.deferred = map[string][]wireMessage{}
+	c.mu.Unlock()
+	// Close stdin as well as cancelling the process: an npm launcher may have
+	// a native child that must receive EOF even if its wrapper is killed.
+	_ = c.Close()
+	for _, waiter := range pending {
+		waiter.response <- rpcResponse{Error: &rpcError{Code: -1, Message: err.Error()}}
+	}
+	for _, state := range active {
+		state.emitEvent(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: state.threadID, TurnID: state.turnID, Done: true,
+			Execution: &core.ExecutionStatus{State: "error", Detail: err.Error()}})
+	}
+}
+
+func (c *Codex) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	stdin := c.stdin
+	c.stdin = nil
+	cancel := c.cancel
+	c.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cancel != nil {
+		cancel()
+	}
+	return nil
+}
+
+func (c *Codex) loadSessions() error {
+	if c.config.SessionsFile == "" {
+		return nil
+	}
+	data, err := os.ReadFile(c.config.SessionsFile)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &c.session)
+}
+
+func (c *Codex) saveSessionsLocked() error {
+	if c.config.SessionsFile == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.config.SessionsFile), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c.session, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsx.AtomicWriteFile(c.config.SessionsFile, append(data, '\n'), 0o600)
+}

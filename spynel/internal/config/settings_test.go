@@ -1,0 +1,405 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestOnlyExtensionSettingsRequireRestart(t *testing.T) {
+	cfg := Default()
+	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.retrigger_unresponded_messages", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.max_parallel"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Restart {
+			t.Fatalf("live setting %q = %#v, present %t", key, setting, ok)
+		}
+	}
+	for _, key := range []string{"extensions.enabled", "extensions.directory", "extensions.hook_timeout"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || !setting.Restart {
+			t.Fatalf("restart-bound setting %q = %#v, present %t", key, setting, ok)
+		}
+	}
+	if _, ok := SettingByKey(cfg, "channels.tui.enabled"); ok {
+		t.Fatal("retired TUI launch preference remains exposed")
+	}
+}
+
+func TestSetSettingParsesSharedCommandValues(t *testing.T) {
+	cfg := Default()
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{"workspace.history_max_messages", "24"},
+		{"workspace.cleanup_retention_days", "45"},
+		{"harness.name", "claude-code"},
+		{"harness.sandbox", "danger-full-access"},
+		{"channels.tui.theme", "catppuccin-latte"},
+		{"channels.telegram.allowed_users", "@one, 42"},
+		{"channels.whatsapp.mode", "dedicated"},
+		{"speech.language", "fr"},
+		{"orchestrator.interval_seconds", "15"},
+		{"orchestrator.semantic_heartbeat_minutes", "30"},
+		{"extensions.hook_timeout", "45s"},
+	} {
+		if _, err := SetSetting(&cfg, test.key, test.value); err != nil {
+			t.Fatalf("set %s: %v", test.key, err)
+		}
+	}
+	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Workspace.CleanupRetentionDays != 45 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Orchestrator.SemanticHeartbeatMinutes != 30 || cfg.Extensions.HookTimeout != "45s" {
+		t.Fatalf("unexpected config after settings: %#v", cfg)
+	}
+}
+
+func TestInferenceSettingsResetToInheritedDefaults(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "effort", "XHIGH"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetSetting(&cfg, "speed", "fast"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "xhigh" || cfg.Harness.ServiceMode != "fast" {
+		t.Fatalf("inference settings = %#v", cfg.Harness)
+	}
+	if setting, err := SetSetting(&cfg, "harness.reasoning_effort", "inherit"); err != nil || setting.Value != "inherit" || cfg.Harness.ReasoningEffort != "" {
+		t.Fatalf("effort reset = %#v, %v", setting, err)
+	}
+	if setting, err := SetSetting(&cfg, "harness.service_mode", "default"); err != nil || setting.Value != "inherit" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("service reset = %#v, %v", setting, err)
+	}
+	if _, err := SetSetting(&cfg, "effort", "ULTRA"); err != nil || cfg.Harness.ReasoningEffort != "ultra" {
+		t.Fatalf("provider-advertised future effort = %q, %v", cfg.Harness.ReasoningEffort, err)
+	}
+	if _, err := SetSetting(&cfg, "effort", "two words"); err == nil {
+		t.Fatal("effort containing whitespace was accepted")
+	}
+	if _, err := SetSetting(&cfg, "effort", strings.Repeat("x", 129)); err == nil {
+		t.Fatal("overlong effort was accepted")
+	}
+}
+
+func TestSpeechSettingsExposeParakeetLanguagesWithoutModelSize(t *testing.T) {
+	cfg := Default()
+	language, ok := SettingByKey(cfg, "speech.language")
+	if !ok {
+		t.Fatal("speech.language setting is missing")
+	}
+	if strings.Join(language.Choices, ",") != strings.Join(SpeechLanguages(), ",") {
+		t.Fatalf("speech language choices = %#v", language.Choices)
+	}
+	for _, removed := range []string{"speech.model", "speech.command", "speech.ffmpeg_command", "speech.model_path"} {
+		if _, ok := SettingByKey(cfg, removed); ok {
+			t.Fatalf("obsolete Whisper setting %q is still exposed", removed)
+		}
+	}
+}
+
+func TestChannelSettingsPutEssentialsFirstAndRemovePromptOverrides(t *testing.T) {
+	cfg := Default()
+	wantEssential := map[string][]string{
+		"telegram": {"channels.telegram.token", "channels.telegram.allowed_users", "channels.telegram.enabled"},
+		"whatsapp": {"channels.whatsapp.mode", "channels.whatsapp.allowed_numbers", "channels.whatsapp.enabled"},
+	}
+	for section, want := range wantEssential {
+		var essential []string
+		advancedStarted := false
+		for _, setting := range Settings(cfg) {
+			if setting.Section != section {
+				continue
+			}
+			if setting.Advanced {
+				advancedStarted = true
+				continue
+			}
+			if advancedStarted {
+				t.Fatalf("%s essential setting %q follows advanced settings", section, setting.Key)
+			}
+			essential = append(essential, setting.Key)
+		}
+		if len(essential) != len(want) {
+			t.Fatalf("%s essentials = %#v, want %#v", section, essential, want)
+		}
+		for index := range want {
+			if essential[index] != want[index] {
+				t.Fatalf("%s essentials = %#v, want %#v", section, essential, want)
+			}
+		}
+	}
+	for _, removed := range []string{
+		"channels.telegram.default_project",
+		"channels.telegram.user_projects",
+		"channels.telegram.agent_instructions",
+		"channels.whatsapp.project",
+		"channels.whatsapp.agent_instructions",
+	} {
+		if _, ok := SettingByKey(cfg, removed); ok {
+			t.Fatalf("removed channel setting %q is still exposed", removed)
+		}
+		if _, err := SetSetting(&cfg, removed, "stale"); err == nil {
+			t.Fatalf("removed channel setting %q can still be changed", removed)
+		}
+	}
+}
+
+func TestWhatsAppAllowedNumbersAreDescribedAsRequired(t *testing.T) {
+	setting, ok := SettingByKey(Default(), "channels.whatsapp.allowed_numbers")
+	if !ok {
+		t.Fatal("WhatsApp allowed-number setting is missing")
+	}
+	if !strings.Contains(strings.ToLower(setting.Description), "required") || strings.Contains(strings.ToLower(setting.Description), "empty allows") {
+		t.Fatalf("WhatsApp allowed-number description = %q", setting.Description)
+	}
+}
+
+func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing.T) {
+	cfg := Default()
+	harnessName, ok := SettingByKey(cfg, "harness.name")
+	if !ok || len(harnessName.Choices) < 3 || strings.Join(harnessName.Choices[:3], ",") != "codex,claude-code,agent-zero" {
+		t.Fatalf("leading harness setting choices = %#v, %t", harnessName.Choices, ok)
+	}
+	var essential []string
+	advancedStarted := false
+	for _, setting := range Settings(cfg) {
+		if setting.Section != "config" {
+			continue
+		}
+		if setting.Advanced {
+			advancedStarted = true
+			continue
+		}
+		if advancedStarted {
+			t.Fatalf("essential setting %q follows advanced settings", setting.Key)
+		}
+		essential = append(essential, setting.Key)
+	}
+	want := []string{"workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled"}
+	if len(essential) != len(want) {
+		t.Fatalf("main essentials = %#v, want %#v", essential, want)
+	}
+	for index := range want {
+		if essential[index] != want[index] {
+			t.Fatalf("main essentials = %#v, want %#v", essential, want)
+		}
+	}
+	for _, key := range []string{
+		"harness.command", "harness.cwd", "harness.effort", "harness.approval_policy", "harness.network",
+		"recipient.command", "recipient.cwd", "recipient.effort", "recipient.approval_policy", "recipient.sandbox", "recipient.network",
+	} {
+		if _, ok := SettingByKey(cfg, key); ok {
+			t.Fatalf("implementation setting %q is still exposed", key)
+		}
+		if _, err := SetSetting(&cfg, key, "unsafe"); err == nil {
+			t.Fatalf("implementation setting %q is still configurable", key)
+		}
+	}
+	for _, key := range []string{
+		"harness.name", "harness.model", "harness.sandbox", "harness.reviews",
+		"harness.chat_agent_prefix", "harness.developer_agent_prefix", "harness.reviewer_agent_prefix", "harness.heartbeat_agent_prefix",
+		"harness.acp_command", "harness.acp_args",
+	} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Section != "harness" {
+			t.Fatalf("harness setting %q = %#v, %t", key, setting, ok)
+		}
+	}
+	prefixDescriptions := map[string]string{
+		"harness.chat_agent_prefix":      "communication-agent messages",
+		"harness.developer_agent_prefix": "implementation and planning agent messages",
+		"harness.reviewer_agent_prefix":  "task and goal reviewer messages",
+		"harness.heartbeat_agent_prefix": "semantic-heartbeat audit agent messages",
+	}
+	for key, role := range prefixDescriptions {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Value != "" || !strings.Contains(setting.Description, "Optionally prefix "+role) || !strings.Contains(setting.Description, "like `/goal`") {
+			t.Fatalf("agent-prefix setting %q = %#v, %t", key, setting, ok)
+		}
+	}
+	for _, key := range []string{"harness.acp_command", "harness.acp_args"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Section != "harness" || !setting.Advanced {
+			t.Fatalf("custom ACP setting %q = %#v, %t", key, setting, ok)
+		}
+	}
+	sandbox, ok := SettingByKey(cfg, "harness.sandbox")
+	if !ok || sandbox.Section != "harness" || len(sandbox.Choices) != 3 || sandbox.Value != "danger-full-access" {
+		t.Fatalf("sandbox setting = %#v, %t", sandbox, ok)
+	}
+	reviews, ok := SettingByKey(cfg, "harness.reviews")
+	if !ok || strings.Join(reviews.Choices, ",") != "skip-trivial,always,never" || reviews.Value != "skip-trivial" {
+		t.Fatalf("review-mode setting = %#v, %t", reviews, ok)
+	}
+}
+
+func TestSetHarnessAgentPolicySettings(t *testing.T) {
+	cfg := Default()
+	_, err := SetSettings(&cfg, map[string]string{
+		"harness.chat_agent_prefix":      "/ultrathink",
+		"harness.developer_agent_prefix": "/dev",
+		"harness.reviewer_agent_prefix":  "/review",
+		"harness.heartbeat_agent_prefix": "/audit",
+		"harness.reviews":                "skip-trivial",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ChatAgentPrefix != "/ultrathink" || cfg.Harness.DeveloperAgentPrefix != "/dev" || cfg.Harness.ReviewerAgentPrefix != "/review" || cfg.Harness.HeartbeatAgentPrefix != "/audit" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
+		t.Fatalf("agent policy settings = %#v", cfg.Harness)
+	}
+	if _, err := SetSetting(&cfg, "harness.reviews", "sometimes"); err == nil {
+		t.Fatal("invalid review mode was accepted")
+	}
+}
+
+func TestCustomACPSettingsParseArgumentsAtomically(t *testing.T) {
+	cfg := Default()
+	changed, err := SetSettings(&cfg, map[string]string{
+		"harness.name":        "acp",
+		"harness.acp_command": "fixture-agent",
+		"harness.acp_args":    `--stdio "value with spaces"`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 4 || cfg.Harness.Name != "acp" || cfg.Harness.ReasoningEffort != "" || cfg.Harness.ACPCommand != "fixture-agent" || len(cfg.Harness.ACPArgs) != 2 || cfg.Harness.ACPArgs[1] != "value with spaces" {
+		t.Fatalf("custom ACP settings = %#v, changes %#v", cfg.Harness, changed)
+	}
+	previous := cfg
+	if _, err := SetSetting(&cfg, "harness.acp_args", `"unterminated`); err == nil {
+		t.Fatal("invalid ACP argument text was accepted")
+	}
+	if _, err := SetSetting(&cfg, "harness.acp_args", "--stdio\n--unsafe"); err == nil {
+		t.Fatal("multiline ACP argument text was accepted")
+	}
+	if cfg.Harness.ACPArgs[1] != previous.Harness.ACPArgs[1] {
+		t.Fatal("failed ACP argument update mutated configuration")
+	}
+}
+
+func TestSetSettingRejectsInvalidAndMasksSecrets(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.whatsapp.poll_interval_seconds", "1"); err == nil {
+		t.Fatal("invalid polling interval succeeded")
+	}
+	if _, err := SetSetting(&cfg, "not.real", "value"); err == nil {
+		t.Fatal("unknown setting succeeded")
+	}
+	setting, err := SetSetting(&cfg, "channels.telegram.token", "123:secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !setting.Secret || setting.Value != "set" || !IsSecretSetting(setting.Key) {
+		t.Fatalf("secret setting was exposed: %#v", setting)
+	}
+}
+
+func TestSetSettingsValidatesRelatedFormFieldsTogether(t *testing.T) {
+	cfg := Default()
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
+	changed, err := SetSettings(&cfg, map[string]string{
+		"channels.telegram.mode":           "webhook",
+		"channels.telegram.webhook_url":    "https://spynel.example",
+		"channels.telegram.webhook_secret": "verification-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 3 || cfg.Channels.Telegram.Mode != "webhook" || cfg.Channels.Telegram.WebhookURL == "" || cfg.Channels.Telegram.WebhookSecret == "" {
+		t.Fatalf("related settings were not applied: %#v, %#v", changed, cfg.Channels.Telegram)
+	}
+}
+
+func TestHarnessChangeClearsStoredUnsupportedInferenceProperties(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "codex"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = "fast"
+	cfg.Harness.reasoningEffortOmitted = false
+
+	changed, err := SetSettings(&cfg, map[string]string{"harness.name": "claude-code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "high" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("Codex to Claude normalization = %#v", cfg.Harness)
+	}
+	if len(changed) != 2 || changed[0].Key != "harness.name" || changed[1].Key != "harness.service_mode" {
+		t.Fatalf("Codex to Claude changed settings = %#v", changed)
+	}
+
+	setting, err := SetSetting(&cfg, "harness.name", "agent-zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setting.Key != "harness.name" || cfg.Harness.ReasoningEffort != "" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("Claude to ACP normalization = setting %#v, harness %#v", setting, cfg.Harness)
+	}
+}
+
+func TestHarnessChangeRejectsExplicitUnsupportedInferenceProperties(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "codex"
+	cfg.Harness.ServiceMode = "fast"
+	previous := cfg
+	if _, err := SetSettings(&cfg, map[string]string{"harness.name": "claude-code", "harness.service_mode": "fast"}); err == nil {
+		t.Fatal("explicit unsupported cross-harness service mode was accepted")
+	}
+	if cfg.Harness.Name != previous.Harness.Name || cfg.Harness.ServiceMode != previous.Harness.ServiceMode {
+		t.Fatalf("failed harness transaction mutated config: %#v", cfg.Harness)
+	}
+}
+
+func TestTelegramWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.telegram.enabled", "on"); err == nil || !strings.Contains(err.Error(), "allowed_users requires at least one user") {
+		t.Fatalf("Telegram enabled without a whitelist: %v", err)
+	}
+	if cfg.Channels.Telegram.Enabled {
+		t.Fatal("failed Telegram enable changed the configuration")
+	}
+	if _, err := SetSettings(&cfg, map[string]string{
+		"channels.telegram.allowed_users": "123456789",
+		"channels.telegram.enabled":       "on",
+	}); err != nil {
+		t.Fatalf("Telegram whitelist and enable transaction failed: %v", err)
+	}
+	if _, err := SetSetting(&cfg, "channels.telegram.allowed_users", ""); err == nil || !strings.Contains(err.Error(), "allowed_users requires at least one user") {
+		t.Fatalf("enabled Telegram whitelist was cleared: %v", err)
+	}
+	if len(cfg.Channels.Telegram.AllowedUsers) != 1 {
+		t.Fatal("failed whitelist clear changed the configuration")
+	}
+}
+
+func TestWhatsAppWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.whatsapp.enabled", "on"); err == nil || !strings.Contains(err.Error(), "allowed_numbers requires at least one number") {
+		t.Fatalf("WhatsApp enabled without an allow-list: %v", err)
+	}
+	if cfg.Channels.WhatsApp.Enabled {
+		t.Fatal("failed WhatsApp enable changed the configuration")
+	}
+	if _, err := SetSettings(&cfg, map[string]string{
+		"channels.whatsapp.allowed_numbers": "+1 (555) 123-4567",
+		"channels.whatsapp.enabled":         "on",
+	}); err != nil {
+		t.Fatalf("WhatsApp allow-list and enable transaction failed: %v", err)
+	}
+	if _, err := SetSetting(&cfg, "channels.whatsapp.allowed_numbers", ""); err == nil || !strings.Contains(err.Error(), "allowed_numbers requires at least one number") {
+		t.Fatalf("enabled WhatsApp allow-list was cleared: %v", err)
+	}
+	if len(cfg.Channels.WhatsApp.AllowedNumbers) != 1 || cfg.Channels.WhatsApp.AllowedNumbers[0] != "+1 (555) 123-4567" {
+		t.Fatalf("failed allow-list clear changed the configuration: %#v", cfg.Channels.WhatsApp.AllowedNumbers)
+	}
+}
+
+func TestRoutesAreNotASetting(t *testing.T) {
+	cfg := Default()
+	if _, ok := SettingByKey(cfg, "orchestrator.routes"); ok {
+		t.Fatal("routes remain exposed")
+	}
+	if _, err := SetSetting(&cfg, "orchestrator.routes", "[]"); err == nil {
+		t.Fatal("retired setting accepted")
+	}
+}

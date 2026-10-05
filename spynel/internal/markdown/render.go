@@ -1,0 +1,886 @@
+package markdown
+
+import (
+	"html"
+	"net/url"
+	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
+	charmansi "github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
+	"github.com/rivo/uniseg"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/text"
+
+	"github.com/agent0ai/spynel/internal/theme"
+)
+
+const (
+	terminalLinkStart = "\x02"
+	terminalLinkEnd   = "\x03"
+	codeBlockStart    = "\x04\x04\x04"
+	codeBlockEnd      = "\x05\x05\x05"
+	osc8Close         = "\x1b]8;;\x1b\\"
+	inlineCodeSpace   = "\U000F0000"
+	compoundHyphen    = "\uE000"
+)
+
+// Terminal renders GitHub-flavored Markdown for an ANSI terminal.
+func Terminal(input string, width int) string {
+	return TerminalWithTheme(input, width, theme.Default())
+}
+
+// TerminalWithTheme renders Markdown with colors drawn exclusively from the
+// active semantic theme.
+func TerminalWithTheme(input string, width int, active theme.Theme) string {
+	return terminalWithTheme(input, max(1, width), active)
+}
+
+func terminalWithTheme(input string, width int, active theme.Theme) string {
+	compoundMarker, inlineMarker := terminalRenderMarkers(input)
+	breakMarker := terminalBreakMarker(input)
+	renderInput := input
+	if width > 0 {
+		renderInput = protectTerminalCompounds(input, width, compoundMarker, breakMarker)
+	}
+	renderInput = protectTerminalCodeEscapes(renderInput)
+	style := terminalStyle(active, inlineMarker)
+	zero := uint(0)
+	style.Document.Margin = &zero
+	style.Document.BlockPrefix = ""
+	style.Document.BlockSuffix = ""
+	style.H1.Prefix = "◆ "
+	// DarkStyleConfig gives H1 a trailing badge cell. Once its background is
+	// removed that invisible suffix still participates in ANSI word wrapping,
+	// which can split short headings at narrow chat widths.
+	style.H1.Suffix = ""
+	style.H2.Prefix = "▸ "
+	style.H3.Prefix = "› "
+	style.H4.Prefix = ""
+	style.H5.Prefix = ""
+	style.H6.Prefix = ""
+	indent := uint(1)
+	indentToken := "│ "
+	style.CodeBlock.Margin = &zero
+	style.CodeBlock.Indent = &indent
+	if width == 0 {
+		style.CodeBlock.Indent = &zero
+	}
+	style.CodeBlock.IndentToken = &indentToken
+	style.CodeBlock.BlockPrefix = codeBlockStart
+	style.CodeBlock.BlockSuffix = codeBlockEnd
+	// Mark the rendered href boundaries before Glamour wraps the document.
+	// They are replaced with destination-specific OSC 8 sequences afterward,
+	// so the control sequence itself cannot be split across display rows.
+	style.Link.BlockPrefix = terminalLinkStart
+	style.Link.BlockSuffix = terminalLinkEnd
+	wrapWidth := width + 1
+	if width == 0 {
+		wrapWidth = 0
+	}
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithStyles(style),
+		glamour.WithColorProfile(termenv.TrueColor),
+		// Glamour's reflow writer wraps when a word reaches the boundary rather
+		// than only when it exceeds it. Give it the exclusive upper bound so the
+		// public width remains the maximum visible row width.
+		glamour.WithWordWrap(wrapWidth),
+		glamour.WithTableWrap(width > 0),
+		glamour.WithPreservedNewLines(),
+	)
+	if err != nil {
+		return input
+	}
+	result, err := renderer.Render(renderInput)
+	if err != nil {
+		return input
+	}
+	inlinePadding := " "
+	if width == 0 {
+		inlinePadding = "\x00"
+	}
+	result = strings.NewReplacer(inlineMarker, inlinePadding, compoundMarker, "-", breakMarker, "\n").Replace(result)
+	result = applyTerminalLinks(result, terminalLinkTargets(input))
+	// Trim renderer margins while code markers still distinguish source blank
+	// lines at the document boundary from artificial outer rows.
+	result = trimTerminalOuterBlankRows(result)
+	result = compactCodeBlockSpacing(result)
+	if width > 0 {
+		result = trimTerminalLinePadding(strings.TrimSpace(result))
+		return trimTerminalOuterBlankRows(result)
+	}
+	return result
+}
+
+// Glamour's BaseElement applies Markdown unescaping even to fenced code.
+// Protect their literal backslashes at the rendering owner, not in a copier.
+func protectTerminalCodeEscapes(input string) string {
+	source := []byte(input)
+	document := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser().Parse(text.NewReader(source))
+	positions := make(map[int]bool)
+	mark := func(start, stop int) {
+		for i := start; i < stop; i++ {
+			if source[i] == '\\' {
+				positions[i] = true
+			}
+		}
+	}
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch node.Kind() {
+		case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+			for i := 0; i < node.Lines().Len(); i++ {
+				line := node.Lines().At(i)
+				mark(line.Start, line.Stop)
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	if len(positions) == 0 {
+		return input
+	}
+	var out strings.Builder
+	for i, b := range source {
+		if positions[i] {
+			out.WriteByte('\\')
+		}
+		out.WriteByte(b)
+	}
+	return out.String()
+}
+
+// protectTerminalCompounds removes ASCII hyphens from Glamour's discretionary
+// break set only for ordinary prose compounds that fit on a fresh content row.
+// Goldmark's source segments keep Markdown syntax, URLs, and code out of the
+// candidate set; the private marker is restored immediately after rendering.
+func protectTerminalCompounds(input string, width int, marker, breakMarker string) string {
+	source := []byte(input)
+	parser := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
+	document := parser.Parse(text.NewReader(source))
+	replacements := make(map[int]string)
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		value, ok := node.(*ast.Text)
+		if !entering || !ok || terminalCompoundExcluded(node) {
+			return ast.WalkContinue, nil
+		}
+		segment := value.Segment
+		available := width - terminalCompoundIndent(node)
+		protectCompoundSegment(source, segment.Start, segment.Stop, available, marker, breakMarker, terminalCompoundAllowsSourceBreak(node), replacements)
+		return ast.WalkContinue, nil
+	})
+	if len(replacements) == 0 {
+		return input
+	}
+	var result strings.Builder
+	result.Grow(len(input) + len(replacements)*(len(marker)-1))
+	for index, value := range source {
+		if replacement, ok := replacements[index]; ok {
+			result.WriteString(replacement)
+			if replacement == marker {
+				continue
+			}
+		}
+		result.WriteByte(value)
+	}
+	return result.String()
+}
+
+func terminalBreakMarker(input string) string {
+	for _, value := range []rune{'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2008', '\u2009', '\u200A', '\u205F', '\u3000'} {
+		if !strings.ContainsRune(input, value) {
+			return string(value)
+		}
+	}
+	longest, run := 0, 0
+	for _, value := range input {
+		if value == '\u200A' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	return strings.Repeat("\u200A", longest+1)
+}
+
+func terminalRenderMarkers(input string) (string, string) {
+	used := make(map[rune]struct{}, len(input)/4)
+	for _, value := range input {
+		used[value] = struct{}{}
+	}
+	markers := make([]string, 0, 2)
+	for _, bounds := range [][2]rune{{0xE000, 0xF8FF}, {0xF0000, 0xFFFFD}, {0x100000, 0x10FFFD}} {
+		for value := bounds[0]; value <= bounds[1] && len(markers) < 2; value++ {
+			if _, found := used[value]; !found {
+				markers = append(markers, string(value))
+			}
+		}
+		if len(markers) == 2 {
+			return markers[0], markers[1]
+		}
+	}
+	return compoundHyphen, inlineCodeSpace
+}
+
+func terminalCompoundExcluded(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.(type) {
+		case *ast.CodeSpan, *ast.Link, *ast.Image, *ast.AutoLink:
+			return true
+		}
+	}
+	return false
+}
+
+func terminalCompoundIndent(node ast.Node) int {
+	indent := 0
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch value := parent.(type) {
+		case *ast.List:
+			indent += terminalListMarkerWidth(node, value)
+		case *ast.Blockquote:
+			indent += 2
+		case *ast.Heading:
+			indent += 2
+		}
+	}
+	return indent
+}
+
+func terminalListMarkerWidth(node ast.Node, list *ast.List) int {
+	if !list.IsOrdered() {
+		return 2
+	}
+	item := node
+	for item != nil && item.Parent() != list {
+		item = item.Parent()
+	}
+	index := list.Start
+	if item != nil {
+		for sibling := list.FirstChild(); sibling != nil && sibling != item; sibling = sibling.NextSibling() {
+			index++
+		}
+	}
+	return len(strconv.Itoa(max(1, index))) + 2
+}
+
+func protectCompoundSegment(source []byte, start, stop, available int, marker, breakMarker string, allowSourceBreak bool, replacements map[int]string) {
+	if available < 3 || start < 0 || stop > len(source) || start >= stop {
+		return
+	}
+	for cursor := start; cursor < stop; {
+		r, size := utf8.DecodeRune(source[cursor:stop])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			cursor += size
+			continue
+		}
+		tokenStart := cursor
+		hyphens := make([]int, 0, 2)
+		componentHasLetter := unicode.IsLetter(r)
+		allComponentsHaveLetters := true
+		cursor += size
+		for cursor < stop {
+			r, size = utf8.DecodeRune(source[cursor:stop])
+			switch {
+			case unicode.IsLetter(r):
+				componentHasLetter = true
+				cursor += size
+			case unicode.IsDigit(r) || unicode.IsMark(r):
+				cursor += size
+			case r == '-' && cursor+size < stop:
+				next, _ := utf8.DecodeRune(source[cursor+size : stop])
+				if !unicode.IsLetter(next) && !unicode.IsDigit(next) {
+					goto tokenDone
+				}
+				allComponentsHaveLetters = allComponentsHaveLetters && componentHasLetter
+				componentHasLetter = false
+				hyphens = append(hyphens, cursor)
+				cursor += size
+			default:
+				goto tokenDone
+			}
+		}
+	tokenDone:
+		allComponentsHaveLetters = allComponentsHaveLetters && componentHasLetter
+		if !allComponentsHaveLetters || terminalCompoundURLAdjacent(source, tokenStart, cursor) {
+			continue
+		}
+		tokenWidth := charmansi.StringWidth(string(source[tokenStart:cursor]))
+		if tokenWidth > available {
+			separator := "\n"
+			if !allowSourceBreak {
+				separator = breakMarker
+			}
+			addTerminalCompoundHardBreaks(source, tokenStart, cursor, available, separator, replacements)
+			continue
+		}
+		if len(hyphens) == 0 {
+			continue
+		}
+		lineStart := bytesLastIndexByte(source[:tokenStart], '\n') + 1
+		if prefixWidth := charmansi.StringWidth(string(source[lineStart:tokenStart])); allowSourceBreak && prefixWidth > 0 && prefixWidth+tokenWidth > available+terminalCompoundIndentForSource(source, lineStart) {
+			replacements[tokenStart] = "\n"
+		}
+		for _, index := range hyphens {
+			replacements[index] = marker
+		}
+	}
+}
+
+func terminalCompoundAllowsSourceBreak(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.(type) {
+		case *ast.Heading, *extast.TableCell, *extast.TableHeader, *extast.TableRow, *extast.Table:
+			return false
+		}
+	}
+	return true
+}
+
+func bytesLastIndexByte(value []byte, target byte) int {
+	for index := len(value) - 1; index >= 0; index-- {
+		if value[index] == target {
+			return index
+		}
+	}
+	return -1
+}
+
+func terminalCompoundIndentForSource(source []byte, lineStart int) int {
+	line := source[lineStart:]
+	for index, value := range line {
+		if value != ' ' && value != '\t' && value != '>' && value != '-' && value != '+' && value != '*' && value != '.' && !unicode.IsDigit(rune(value)) {
+			return index
+		}
+	}
+	return 0
+}
+
+func addTerminalCompoundHardBreaks(source []byte, start, stop, available int, separator string, replacements map[int]string) {
+	componentStart := start
+	for componentStart < stop {
+		hyphen := componentStart
+		for hyphen < stop && source[hyphen] != '-' {
+			hyphen++
+		}
+		capacity := available
+		if hyphen < stop {
+			capacity = max(1, available-1) // retain the visible trailing hyphen
+		}
+		cells := 0
+		graphemes := uniseg.NewGraphemes(string(source[componentStart:hyphen]))
+		for graphemes.Next() {
+			from, _ := graphemes.Positions()
+			cursor := componentStart + from
+			width := charmansi.StringWidth(graphemes.Str())
+			if cells > 0 && cells+width > capacity {
+				replacements[cursor] = separator
+				cells = 0
+			}
+			cells += width
+		}
+		if hyphen == stop {
+			break
+		}
+		if hyphen+1 < stop {
+			replacements[hyphen+1] = separator
+		}
+		componentStart = hyphen + 1
+	}
+}
+
+func terminalCompoundURLAdjacent(source []byte, start, stop int) bool {
+	const urlPunctuation = "-/:@.?&#%="
+	return start > 0 && strings.ContainsRune(urlPunctuation, rune(source[start-1])) ||
+		stop < len(source) && strings.ContainsRune(urlPunctuation, rune(source[stop]))
+}
+
+func trimTerminalLinePadding(value string) string {
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		lines[index] = trimTerminalRowPadding(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TrimTerminalLinePadding removes unstyled renderer padding from every row
+// without discarding background-colored display cells. It is exported for TUI
+// layout stages that defensively normalize already-rendered Markdown.
+func TrimTerminalLinePadding(value string) string {
+	return trimTerminalLinePadding(value)
+}
+
+// trimTerminalRowPadding removes layout whitespace emitted after the last
+// rendered cell while retaining whitespace whose background is part of the
+// presentation. In particular, Glamour renders inline code as a foreground
+// token between two background-colored spaces. Plain-text trimming cannot
+// distinguish that right padding from document padding at the end of a row.
+func trimTerminalRowPadding(line string) string {
+	parser := charmansi.NewParser()
+	state := byte(charmansi.NormalState)
+	background := false
+	width := 0
+	keepWidth := 0
+	rest := line
+	for len(rest) > 0 {
+		sequence, cellWidth, consumed, nextState := charmansi.DecodeSequence(rest, state, parser)
+		if consumed <= 0 {
+			break
+		}
+		state = nextState
+		rest = rest[consumed:]
+		if cellWidth > 0 {
+			width += cellWidth
+			if strings.Trim(string(sequence), " \t") != "" || background {
+				keepWidth = width
+			}
+			continue
+		}
+		if byte(parser.Command()) == 'm' {
+			background = sgrBackground(parser, background)
+		}
+	}
+	return charmansi.Truncate(line, keepWidth, "")
+}
+
+func sgrBackground(parser *charmansi.Parser, active bool) bool {
+	parameters := parser.Params()
+	if len(parameters) == 0 {
+		return false
+	}
+	for index := range parameters {
+		parameter, _ := parser.Param(index, 0)
+		switch {
+		case parameter == 0 || parameter == 49:
+			active = false
+		case parameter == 48, parameter >= 40 && parameter <= 47, parameter >= 100 && parameter <= 107:
+			active = true
+		}
+	}
+	return active
+}
+
+func trimTerminalOuterBlankRows(value string) string {
+	lines := strings.Split(value, "\n")
+	for len(lines) > 0 && !strings.Contains(lines[0], codeBlockStart) && visuallyBlank(lines[0]) {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && !strings.Contains(lines[len(lines)-1], codeBlockEnd) && visuallyBlank(lines[len(lines)-1]) {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func terminalStyle(active theme.Theme, inlineMarkers ...string) ansi.StyleConfig { //nolint:gocyclo
+	style := styles.DarkStyleConfig
+	if style.CodeBlock.Chroma != nil {
+		chroma := *style.CodeBlock.Chroma
+		style.CodeBlock.Chroma = &chroma
+	}
+	c := active.Colors
+	set := func(primitive *ansi.StylePrimitive, foreground string, background ...string) {
+		primitive.Color = stringPointer(foreground)
+		if len(background) > 0 {
+			primitive.BackgroundColor = stringPointer(background[0])
+		} else {
+			primitive.BackgroundColor = nil
+		}
+	}
+	set(&style.Document.StylePrimitive, c.Text)
+	set(&style.BlockQuote.StylePrimitive, c.TextMuted)
+	set(&style.Paragraph.StylePrimitive, c.Text)
+	set(&style.List.StylePrimitive, c.Text)
+	set(&style.Heading.StylePrimitive, c.Primary)
+	set(&style.H1.StylePrimitive, c.Primary)
+	set(&style.H2.StylePrimitive, c.Primary)
+	set(&style.H3.StylePrimitive, c.Secondary)
+	set(&style.H4.StylePrimitive, c.Secondary)
+	set(&style.H5.StylePrimitive, c.Info)
+	set(&style.H6.StylePrimitive, c.Info)
+	set(&style.Text, c.Text)
+	set(&style.Strikethrough, c.TextMuted)
+	set(&style.Emph, c.Text)
+	set(&style.Strong, c.Primary)
+	set(&style.HorizontalRule, c.Border)
+	set(&style.Item, c.Primary)
+	set(&style.Enumeration, c.Primary)
+	set(&style.Task.StylePrimitive, c.Secondary)
+	set(&style.Link, c.Info)
+	set(&style.LinkText, c.Info)
+	set(&style.Image, c.Secondary)
+	set(&style.ImageText, c.TextMuted)
+	set(&style.Code.StylePrimitive, c.Code, c.SurfaceElevated)
+	// A private render-only padding cell keeps the left cell attached to inline
+	// code during Glamour's word reflow. It is converted to an ordinary styled
+	// space immediately after rendering, so source/history semantics are
+	// unchanged, user-authored nonbreaking spaces survive, and terminal
+	// selection sees a normal space.
+	inlineMarker := inlineCodeSpace
+	if len(inlineMarkers) > 0 {
+		inlineMarker = inlineMarkers[0]
+	}
+	style.Code.Prefix = inlineMarker
+	style.Code.Suffix = inlineMarker
+	set(&style.CodeBlock.StylePrimitive, c.Code)
+	set(&style.Table.StylePrimitive, c.Text)
+	set(&style.DefinitionList.StylePrimitive, c.Text)
+	set(&style.DefinitionTerm, c.Primary)
+	set(&style.DefinitionDescription, c.Text)
+	set(&style.HTMLBlock.StylePrimitive, c.TextMuted)
+	set(&style.HTMLSpan.StylePrimitive, c.TextMuted)
+
+	// Glamour registers custom Chroma styles under one process-global name, so
+	// the first rendered theme otherwise leaks into every later code block.
+	// Render fenced code uniformly with the semantic code role instead.
+	style.CodeBlock.Theme = ""
+	style.CodeBlock.Chroma = nil
+	return style
+}
+
+func stringPointer(value string) *string { return &value }
+
+// compactCodeBlockSpacing removes only blank rendered rows immediately next
+// to code blocks. Boundary markers let this remain independent of ANSI styles
+// and preserve ordinary paragraph gaps and intentional blank code lines.
+func compactCodeBlockSpacing(value string) string {
+	lines := strings.Split(value, "\n")
+	result := make([]string, 0, len(lines))
+	skipBlank := false
+	for _, line := range lines {
+		hasStart := strings.Contains(line, codeBlockStart)
+		hasEnd := strings.Contains(line, codeBlockEnd)
+		line = strings.ReplaceAll(strings.ReplaceAll(line, codeBlockStart, ""), codeBlockEnd, "")
+		if hasStart && !skipBlank {
+			for len(result) > 0 && visuallyBlank(result[len(result)-1]) {
+				result = result[:len(result)-1]
+			}
+		}
+		if skipBlank && !hasStart && visuallyBlank(line) {
+			continue
+		}
+		skipBlank = false
+		if !hasEnd || !visuallyBlank(line) {
+			result = append(result, line)
+		}
+		if hasEnd {
+			skipBlank = true
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
+func visuallyBlank(value string) bool {
+	return strings.TrimSpace(charmansi.Strip(value)) == ""
+}
+
+func terminalLinkTargets(input string) []string {
+	source := []byte(input)
+	parser := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
+	document := parser.Parse(text.NewReader(source))
+	var targets []string
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch value := node.(type) {
+		case *ast.Link:
+			destination := string(value.Destination)
+			if !strings.HasPrefix(destination, "#") {
+				targets = append(targets, terminalLinkTarget(destination))
+			}
+		case *ast.AutoLink:
+			targets = append(targets, terminalLinkTarget(string(value.URL(source))))
+		}
+		return ast.WalkContinue, nil
+	})
+	return targets
+}
+
+func terminalLinkTarget(destination string) string {
+	if destination == "" || strings.ContainsAny(destination, "\x00\x1b\a") {
+		return ""
+	}
+	if strings.HasPrefix(destination, "/") {
+		path, fragment := filePosition(destination)
+		if decoded, err := url.PathUnescape(path); err == nil {
+			path = decoded
+		}
+		return (&url.URL{Scheme: "file", Path: path, Fragment: fragment}).String()
+	}
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file", "ftp", "http", "https", "mailto":
+		return parsed.String()
+	default:
+		// This renderer has no reliable base directory for relative paths.
+		return ""
+	}
+}
+
+func filePosition(destination string) (string, string) {
+	lastColon := strings.LastIndexByte(destination, ':')
+	if lastColon < 1 {
+		return destination, ""
+	}
+	last, err := strconv.Atoi(destination[lastColon+1:])
+	if err != nil || last < 1 {
+		return destination, ""
+	}
+	previousColon := strings.LastIndexByte(destination[:lastColon], ':')
+	if previousColon > 0 {
+		line, lineErr := strconv.Atoi(destination[previousColon+1 : lastColon])
+		if lineErr == nil && line > 0 {
+			return destination[:previousColon], strconv.Itoa(line) + ":" + strconv.Itoa(last)
+		}
+	}
+	return destination[:lastColon], strconv.Itoa(last)
+}
+
+func applyTerminalLinks(rendered string, targets []string) string {
+	var result strings.Builder
+	rest := rendered
+	for _, target := range targets {
+		start := strings.Index(rest, terminalLinkStart)
+		if start < 0 {
+			break
+		}
+		contentStart := start + len(terminalLinkStart)
+		endOffset := strings.Index(rest[contentStart:], terminalLinkEnd)
+		if endOffset < 0 {
+			break
+		}
+		end := contentStart + endOffset
+		result.WriteString(rest[:start])
+		if target != "" {
+			result.WriteString("\x1b]8;;")
+			result.WriteString(target)
+			result.WriteString("\x1b\\")
+		}
+		result.WriteString(rest[contentStart:end])
+		if target != "" {
+			result.WriteString(osc8Close)
+		}
+		rest = rest[end+len(terminalLinkEnd):]
+	}
+	result.WriteString(strings.ReplaceAll(strings.ReplaceAll(rest, terminalLinkStart, ""), terminalLinkEnd, ""))
+	return result.String()
+}
+
+// TelegramHTML converts GitHub-flavored Markdown to Telegram's supported HTML
+// subset. Unsupported block structure is flattened into readable text.
+func TelegramHTML(input string) string {
+	return render(input, telegram)
+}
+
+// WhatsApp converts GitHub-flavored Markdown to WhatsApp's native lightweight
+// formatting syntax.
+func WhatsApp(input string) string {
+	return render(input, whatsapp)
+}
+
+type platform int
+
+const (
+	telegram platform = iota
+	whatsapp
+)
+
+type nativeRenderer struct {
+	source []byte
+	mode   platform
+}
+
+func render(input string, mode platform) string {
+	source := []byte(input)
+	parser := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
+	document := parser.Parse(text.NewReader(source))
+	renderer := nativeRenderer{source: source, mode: mode}
+	return strings.TrimSpace(compactCodeBlockSpacing(renderer.node(document)))
+}
+
+func (r nativeRenderer) node(node ast.Node) string { //nolint:gocyclo
+	switch value := node.(type) {
+	case *ast.Document:
+		return r.children(node)
+	case *ast.Text:
+		result := r.escape(string(value.Segment.Value(r.source)))
+		if value.SoftLineBreak() || value.HardLineBreak() {
+			result += "\n"
+		}
+		return result
+	case *ast.String:
+		return r.escape(string(value.Value))
+	case *ast.Paragraph, *ast.TextBlock:
+		return strings.TrimSpace(r.children(node)) + "\n\n"
+	case *ast.Heading:
+		content := strings.TrimSpace(r.children(node))
+		if r.mode == telegram {
+			return "<b>" + content + "</b>\n\n"
+		}
+		return "*" + content + "*\n\n"
+	case *ast.Emphasis:
+		content := r.children(node)
+		if r.mode == telegram {
+			if value.Level == 2 {
+				return "<b>" + content + "</b>"
+			}
+			return "<i>" + content + "</i>"
+		}
+		if value.Level == 2 {
+			return "*" + content + "*"
+		}
+		return "_" + content + "_"
+	case *extast.Strikethrough:
+		content := r.children(node)
+		if r.mode == telegram {
+			return "<s>" + content + "</s>"
+		}
+		return "~" + content + "~"
+	case *ast.CodeSpan:
+		content := strings.TrimSpace(r.children(node))
+		if r.mode == telegram {
+			return "<code>" + content + "</code>"
+		}
+		return "`" + content + "`"
+	case *ast.FencedCodeBlock:
+		return r.codeBlock(value, string(value.Language(r.source)))
+	case *ast.CodeBlock:
+		return r.codeBlock(value, "")
+	case *ast.Link:
+		return r.link(r.children(node), string(value.Destination))
+	case *ast.Image:
+		return r.link("Image: "+r.children(node), string(value.Destination))
+	case *ast.AutoLink:
+		url := string(value.URL(r.source))
+		return r.link(r.escape(url), url)
+	case *ast.Blockquote:
+		content := strings.TrimSpace(r.children(node))
+		if r.mode == telegram {
+			return "<blockquote>" + content + "</blockquote>\n\n"
+		}
+		return prefixLines(content, "> ") + "\n\n"
+	case *ast.List:
+		return r.list(value)
+	case *ast.ListItem:
+		return strings.TrimSpace(r.children(node))
+	case *ast.ThematicBreak:
+		return "────────\n\n"
+	case *extast.Table:
+		return strings.TrimSpace(r.children(node)) + "\n\n"
+	case *extast.TableHeader, *extast.TableRow:
+		var cells []string
+		for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+			cells = append(cells, strings.TrimSpace(r.node(child)))
+		}
+		return strings.Join(cells, " | ") + "\n"
+	case *extast.TableCell:
+		return r.children(node)
+	case *ast.RawHTML:
+		return ""
+	default:
+		return r.children(node)
+	}
+}
+
+func (r nativeRenderer) children(node ast.Node) string {
+	var result strings.Builder
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		result.WriteString(r.node(child))
+	}
+	return result.String()
+}
+
+func (r nativeRenderer) codeBlock(node ast.Node, language string) string {
+	var code strings.Builder
+	for index := 0; index < node.Lines().Len(); index++ {
+		segment := node.Lines().At(index)
+		code.Write(segment.Value(r.source))
+	}
+	content := strings.TrimSuffix(code.String(), "\n")
+	if r.mode == telegram {
+		class := ""
+		if language != "" {
+			class = ` class="language-` + html.EscapeString(language) + `"`
+		}
+		return codeBlockStart + "<pre><code" + class + ">" + html.EscapeString(content) + "</code></pre>" + codeBlockEnd + "\n\n"
+	}
+	return codeBlockStart + "```\n" + content + "\n```" + codeBlockEnd + "\n\n"
+}
+
+func (r nativeRenderer) list(list *ast.List) string {
+	var result strings.Builder
+	index := list.Start
+	for child := list.FirstChild(); child != nil; child = child.NextSibling() {
+		content := strings.TrimSpace(r.node(child))
+		prefix := "• "
+		if r.mode == whatsapp {
+			prefix = "- "
+		}
+		if list.IsOrdered() {
+			prefix = formatNumber(index) + ". "
+			index++
+		}
+		result.WriteString(prefix)
+		result.WriteString(strings.ReplaceAll(content, "\n", "\n  "))
+		result.WriteByte('\n')
+	}
+	result.WriteByte('\n')
+	return result.String()
+}
+
+func (r nativeRenderer) link(label, destination string) string {
+	if r.mode == telegram {
+		return `<a href="` + html.EscapeString(destination) + `">` + label + `</a>`
+	}
+	if label == destination {
+		return destination
+	}
+	return label + " (" + destination + ")"
+}
+
+func (r nativeRenderer) escape(value string) string {
+	if r.mode == telegram {
+		return html.EscapeString(value)
+	}
+	return value
+}
+
+func prefixLines(value, prefix string) string {
+	lines := strings.Split(value, "\n")
+	for index := range lines {
+		lines[index] = prefix + lines[index]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatNumber(value int) string {
+	if value == 0 {
+		value = 1
+	}
+	const digits = "0123456789"
+	if value < 10 {
+		return string(digits[value])
+	}
+	var reversed []byte
+	for value > 0 {
+		reversed = append(reversed, digits[value%10])
+		value /= 10
+	}
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	return string(reversed)
+}

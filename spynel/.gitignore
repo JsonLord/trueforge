@@ -1,0 +1,19 @@
+# Local configuration, runtime state, and secrets
+.env
+.spynel/
+# Repository-local disposable scratch and build outputs
+.tmp*/
+/.reviewer-probe/
+/npm/vendor/
+
+# Go test/build artifacts
+*.test
+*.out
+coverage.*
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

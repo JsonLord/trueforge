@@ -1,0 +1,1197 @@
+package history
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/shortid"
+)
+
+const (
+	historyReadChunk     = 64 * 1024
+	maxHistoryEntryBytes = 4 * 1024 * 1024
+)
+
+type Entry struct {
+	At               time.Time `json:"at"`
+	Role             string    `json:"role"`
+	Sender           string    `json:"sender,omitempty"`
+	ReplyTo          string    `json:"reply_to,omitempty"`
+	Content          string    `json:"content"`
+	EventID          string    `json:"event_id,omitempty"`
+	AfterChars       int       `json:"after_chars,omitempty"`
+	Terminal         bool      `json:"terminal,omitempty"`
+	FinalText        *string   `json:"final_text,omitempty"`
+	Continues        bool      `json:"continues,omitempty"`
+	SourceMessageID  string    `json:"source_message_id,omitempty"`
+	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
+	ExecutionID      string    `json:"execution_id,omitempty"`
+	Admission        string    `json:"admission,omitempty"`
+	Covers           []string  `json:"covers,omitempty"`
+	Outcome          string    `json:"outcome,omitempty"`
+	RetriggerOf      []string  `json:"retrigger_of,omitempty"`
+	Recovery         bool      `json:"recovery,omitempty"`
+	RecoveryBaseline bool      `json:"recovery_baseline,omitempty"`
+	compact          bool
+}
+
+// ActivateRecovery establishes the forward-only correlation boundary. The
+// first upgraded startup creates it without inspecting or rewriting history;
+// entries before it remain categorically ineligible for recovery.
+func (s *Store) ActivateRecovery() (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.root, ".retrigger-v1.json")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var value struct {
+			ActivatedAt time.Time `json:"activated_at"`
+		}
+		if json.Unmarshal(data, &value) != nil || value.ActivatedAt.IsZero() {
+			return time.Time{}, errors.New("invalid conversation recovery activation baseline")
+		}
+		return value.ActivatedAt.UTC(), nil
+	}
+	if !os.IsNotExist(err) {
+		return time.Time{}, err
+	}
+	activatedAt := time.Now().UTC()
+	value := struct {
+		ActivatedAt time.Time `json:"activated_at"`
+	}{ActivatedAt: activatedAt}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return time.Time{}, err
+	}
+	if err := fsx.AtomicWriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+		return time.Time{}, err
+	}
+	return activatedAt, nil
+}
+
+type Conversation struct {
+	Channel      string
+	Conversation string
+	Path         string
+	UpdatedAt    time.Time
+	LastRole     string
+	Preview      string
+}
+
+type CleanupResult struct {
+	Removed   int
+	Protected int
+	Failed    int
+}
+
+type Store struct {
+	root string
+	mu   sync.Mutex
+}
+
+var unsafePath = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
+
+func New(root string) *Store {
+	return &Store{root: root}
+}
+
+func (s *Store) Path(channel, conversation string) string {
+	return filepath.Join(s.root, clean(channel), clean(conversation)+".jsonl")
+}
+
+func (s *Store) userActivityPath(channel, conversation string) string {
+	return filepath.Join(s.root, ".user-activity", clean(channel), clean(conversation)+".json")
+}
+
+func clean(value string) string {
+	value = strings.Trim(unsafePath.ReplaceAllString(value, "_"), "._")
+	if value == "" {
+		return "default"
+	}
+	if len(value) > 120 {
+		value = value[:120]
+	}
+	return value
+}
+
+func (s *Store) Append(channel, conversation string, entry Entry) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendLocked(channel, conversation, entry)
+}
+
+func (s *Store) appendLocked(channel, conversation string, entry Entry) (string, error) {
+	path := s.Path(channel, conversation)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if entry.At.IsZero() {
+		entry.At = time.Now().UTC()
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if entry.Role == "user" {
+		activity, err := json.Marshal(struct {
+			At time.Time `json:"at"`
+		}{At: entry.At.UTC()})
+		if err != nil {
+			return "", err
+		}
+		activityPath := s.userActivityPath(channel, conversation)
+		if err := os.MkdirAll(filepath.Dir(activityPath), 0o700); err != nil {
+			return "", err
+		}
+		if err := fsx.AtomicWriteFile(activityPath, append(activity, '\n'), 0o600); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
+}
+
+// ReserveRetrigger atomically rechecks exact source coverage and appends one
+// recovery reservation. A concurrent terminal/cancellation append therefore
+// wins either before this check or after the durable retrigger fact, never in
+// an uncovered gap.
+func (s *Store) ReserveRetrigger(channel, conversation string, requested []string, activation, cutoff time.Time, max int) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	wanted := map[string]bool{}
+	for _, id := range requested {
+		if id != "" {
+			wanted[id] = true
+		}
+	}
+	covered := map[string]bool{}
+	admitted := map[string]bool{}
+	users := map[string]Entry{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	count := 0
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		count++
+		if max > 0 && count > max {
+			return nil, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, errors.New("conversation history contains corrupt correlation data")
+		}
+		if entry.RecoveryBaseline {
+			covered = map[string]bool{}
+			admitted = map[string]bool{}
+			users = map[string]Entry{}
+			continue
+		}
+		for _, id := range entry.Covers {
+			covered[id] = true
+		}
+		for _, id := range entry.RetriggerOf {
+			covered[id] = true
+		}
+		if wanted[entry.SourceMessageID] && entry.Admission != "" {
+			admitted[entry.SourceMessageID] = true
+		}
+		if entry.Role == "user" && wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) && !entry.At.Before(cutoff) {
+			users[entry.SourceMessageID] = entry
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(users))
+	for id := range users {
+		if !covered[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if _, err := s.appendLocked(channel, conversation, Entry{Role: "correlation", RetriggerOf: ids}); err != nil {
+		return nil, err
+	}
+	result := make([]Entry, 0, len(ids))
+	for _, id := range ids {
+		entry := users[id]
+		if admitted[id] {
+			entry.Admission = "admitted"
+		}
+		result = append(result, entry)
+	}
+	return result, nil
+}
+
+// Ensure creates an empty durable conversation without adding a synthetic
+// message. It is used when a UI switches identity before the first user turn.
+func (s *Store) Ensure(channel, conversation string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if os.IsExist(err) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return path, file.Close()
+}
+
+func (s *Store) DeliveryState(channel, conversation, eventID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := os.Open(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	state := ""
+	for scanner.Scan() {
+		var entry Entry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
+			switch entry.Role {
+			case "notification_sending":
+				state = "sending"
+			case "notification_failed":
+				state = "failed"
+			case "assistant":
+				if entry.Sender == "Spy" {
+					state = "sent"
+				}
+			}
+		}
+	}
+	return state, scanner.Err()
+}
+
+func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {
+	return s.RecentBounded(channel, conversation, -1, characterLimit)
+}
+
+// RecentBounded reads JSONL from the end of the file and stops as soon as the
+// requested message and character window is satisfied. A zero message limit
+// disables history context; a negative value leaves only the character bound.
+func (s *Store) RecentBounded(channel, conversation string, messageLimit, characterLimit int) (string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	if characterLimit <= 0 || messageLimit == 0 {
+		return "", path, nil
+	}
+	entries, err := readRecentEntries(path, messageLimit, characterLimit)
+	if err != nil {
+		return "", path, err
+	}
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, formatEntry(entry))
+	}
+	result := strings.Join(lines, "\n")
+	runes := []rune(result)
+	if len(runes) > characterLimit {
+		result = string(runes[len(runes)-characterLimit:])
+	}
+	return result, path, nil
+}
+
+// RecentEntries returns a bounded structured tail for TUI display without
+// loading the complete append-only conversation.
+func (s *Store) RecentEntries(channel, conversation string, messageLimit, characterLimit int) ([]Entry, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	if messageLimit == 0 || characterLimit <= 0 {
+		return nil, path, nil
+	}
+	entries, err := readRecentEntries(path, messageLimit, characterLimit)
+	return entries, path, err
+}
+
+// RecentEntriesSnapshot returns a bounded visible tail and the exact byte
+// boundary it represents. A file follower can begin at that boundary without
+// losing or duplicating an append that races TUI startup.
+func (s *Store) RecentEntriesSnapshot(channel, conversation string, messageLimit, characterLimit int) ([]Entry, string, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, path, 0, nil
+	}
+	if err != nil {
+		return nil, path, 0, err
+	}
+	info, err := file.Stat()
+	file.Close()
+	if err != nil {
+		return nil, path, 0, err
+	}
+	boundary := info.Size()
+	if messageLimit == 0 || characterLimit <= 0 {
+		return nil, path, boundary, nil
+	}
+	entries, err := readRecentEntriesThrough(path, messageLimit, characterLimit, boundary)
+	return entries, path, boundary, err
+}
+
+func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, error) {
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return readRecentEntriesThroughFile(file, messageLimit, characterLimit, info.Size())
+}
+
+func readRecentEntriesThrough(path string, messageLimit, characterLimit int, boundary int64) ([]Entry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readRecentEntriesThroughFile(file, messageLimit, characterLimit, boundary)
+}
+
+func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit int, boundary int64) ([]Entry, error) {
+	position := boundary
+	var carry []byte
+	var reversed []Entry
+	used := 0
+	stopped := false
+	consume := func(line []byte) {
+		if stopped || len(bytes.TrimSpace(line)) == 0 {
+			return
+		}
+		var entry Entry
+		if json.Unmarshal(line, &entry) != nil {
+			return
+		}
+		if entry.Role == "correlation" {
+			return
+		}
+		formatted := formatEntry(entry)
+		characters := len([]rune(formatted))
+		if len(reversed) == 0 && characters > characterLimit {
+			var ok bool
+			entry, ok = boundNewestEntry(entry, characterLimit)
+			if !ok {
+				stopped = true
+				return
+			}
+			formatted = formatEntry(entry)
+			characters = len([]rune(formatted))
+		}
+		if len(reversed) > 0 {
+			characters++
+		}
+		if messageLimit > 0 && len(reversed) >= messageLimit {
+			stopped = true
+			return
+		}
+		if used > 0 && used+characters > characterLimit {
+			stopped = true
+			return
+		}
+		reversed = append(reversed, entry)
+		used += characters
+		if (messageLimit > 0 && len(reversed) >= messageLimit) || used >= characterLimit {
+			stopped = true
+		}
+	}
+	for position > 0 && !stopped {
+		readSize := int64(historyReadChunk)
+		if position < readSize {
+			readSize = position
+		}
+		position -= readSize
+		chunk := make([]byte, readSize)
+		if _, err := file.ReadAt(chunk, position); err != nil {
+			return nil, err
+		}
+		block := make([]byte, 0, len(chunk)+len(carry))
+		block = append(block, chunk...)
+		block = append(block, carry...)
+		parts := bytes.Split(block, []byte{'\n'})
+		carry = append(carry[:0], parts[0]...)
+		if len(carry) > maxHistoryEntryBytes {
+			return nil, fmt.Errorf("history entry exceeds %d bytes", maxHistoryEntryBytes)
+		}
+		for index := len(parts) - 1; index >= 1 && !stopped; index-- {
+			consume(parts[index])
+		}
+	}
+	if position == 0 && !stopped {
+		consume(carry)
+	}
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	return resolveNotificationOrder(reversed), nil
+}
+
+func formatEntry(entry Entry) string {
+	reply := ""
+	if entry.ReplyTo != "" {
+		reply = "[reply_to: " + entry.ReplyTo + "]"
+	}
+	if entry.compact {
+		if entry.Content == "" {
+			return reply
+		}
+		return reply + " " + entry.Content
+	}
+	label := entry.Role
+	if entry.Sender != "" {
+		label += " (" + entry.Sender + ")"
+	}
+	if reply != "" {
+		reply += " "
+	}
+	return fmt.Sprintf("[%s] %s: %s%s", entry.At.Format(time.RFC3339), label, reply, entry.Content)
+}
+
+func boundNewestEntry(entry Entry, limit int) (Entry, bool) {
+	if limit <= 0 {
+		return Entry{}, false
+	}
+	if entry.ReplyTo == "" {
+		content := []rune(entry.Content)
+		if len(content) > limit {
+			entry.Content = "…" + string(content[len(content)-limit:])
+		}
+		return entry, true
+	}
+	for _, compact := range []bool{false, true} {
+		candidate, ok := boundReplyEntry(entry, limit, compact)
+		if ok {
+			return candidate, true
+		}
+	}
+	// A bound too small for a complete labeled native ID is safer as an empty
+	// history window than a misleading tail-sliced identifier.
+	return Entry{}, false
+}
+
+func boundReplyEntry(entry Entry, limit int, compact bool) (Entry, bool) {
+	id, preview := splitReply(entry.ReplyTo)
+	if id == "" {
+		return Entry{}, false
+	}
+	candidate := entry
+	candidate.compact = compact
+	candidate.ReplyTo = id
+	candidate.Content = ""
+	base := len([]rune(formatEntry(candidate)))
+	previewRunes := []rune(preview)
+	contentRunes := []rune(entry.Content)
+	minimum := base
+	if len(previewRunes) > 0 {
+		minimum += 2 // space and visible truncation marker
+	}
+	if len(contentRunes) > 0 {
+		minimum += 2 // separator and visible truncation marker
+	}
+	if minimum > limit {
+		return Entry{}, false
+	}
+	remaining := limit - base
+	if len(previewRunes) > 0 {
+		budget := remaining - 1
+		if len(contentRunes) > 0 {
+			budget -= 2
+		}
+		preview = truncateHead(previewRunes, budget)
+		candidate.ReplyTo = id + " " + preview
+		remaining -= 1 + len([]rune(preview))
+	}
+	if len(contentRunes) > 0 {
+		budget := remaining - 1
+		candidate.Content = truncateTail(contentRunes, budget)
+	}
+	return candidate, len([]rune(formatEntry(candidate))) <= limit
+}
+
+func splitReply(value string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], strings.TrimSpace(parts[1])
+}
+
+func truncateHead(value []rune, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return string(value)
+	}
+	if budget == 1 {
+		return "…"
+	}
+	return string(value[:budget-1]) + "…"
+}
+
+func truncateTail(value []rune, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return string(value)
+	}
+	if budget == 1 {
+		return "…"
+	}
+	return "…" + string(value[len(value)-budget+1:])
+}
+
+// Entries returns the complete user-visible structured transcript for one
+// channel conversation in append order; private correlation facts remain
+// available only through recovery-specific strict readers.
+func (s *Store) Entries(channel, conversation string) ([]Entry, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	entries, err := readEntries(path)
+	if err != nil {
+		return nil, path, err
+	}
+	visible := entries[:0]
+	for _, entry := range entries {
+		if entry.Role != "correlation" {
+			visible = append(visible, entry)
+		}
+	}
+	return visible, path, nil
+}
+
+func (s *Store) HasEntries(channel, conversation string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, err := os.Stat(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Size() > 0, nil
+}
+
+// HasUserSourceID strictly checks retained history with bounded memory.
+// Recovery's entry limit must not prevent new messages in long conversations.
+func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, error) {
+	if sourceID == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := os.Open(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	// ponytail: linear scan; add a durable source-ID index if admission gets slow.
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
+	found := false
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return false, errors.New("conversation history contains corrupt correlation data")
+		}
+		if entry.Role == "user" && entry.SourceMessageID == sourceID {
+			found = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+// RecoveryEntries strictly reads at most max append-only entries. Recovery
+// never skips corrupt JSON or silently truncates an oversized conversation.
+func (s *Store) RecoveryEntries(channel, conversation string, max int) ([]Entry, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, path, nil
+	}
+	if err != nil {
+		return nil, path, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	entries := make([]Entry, 0, min(max, 128))
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, path, errors.New("conversation history contains corrupt correlation data")
+		}
+		entries = append(entries, entry)
+		if max > 0 && len(entries) > max {
+			return nil, path, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, path, err
+	}
+	return entries, path, nil
+}
+
+// RecoveryTail strictly validates a bounded file prefix while retaining only
+// the newest tailMax entries. It never treats omitted overflow as handled.
+func (s *Store) RecoveryTail(channel, conversation string, tailMax, scanMax int) ([]Entry, bool, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, false, path, nil
+	}
+	if err != nil {
+		return nil, false, path, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	entries := make([]Entry, 0, min(tailMax, 128))
+	count := 0
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		count++
+		if scanMax > 0 && count > scanMax {
+			return nil, true, path, fmt.Errorf("conversation history exceeds recovery scan bound of %d entries", scanMax)
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, false, path, errors.New("conversation history contains corrupt correlation data")
+		}
+		if tailMax <= 0 {
+			continue
+		}
+		if len(entries) == tailMax {
+			copy(entries, entries[1:])
+			entries[len(entries)-1] = entry
+		} else {
+			entries = append(entries, entry)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false, path, err
+	}
+	return entries, tailMax > 0 && count > tailMax, path, nil
+}
+
+// List discovers conversations from disk and reads only one bounded tail entry
+// per file. No transcript bodies are retained merely to populate a picker.
+func (s *Store) List(limit int) ([]Conversation, error) {
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var conversations []Conversation
+	for _, channelEntry := range channels {
+		if !channelEntry.IsDir() {
+			continue
+		}
+		channelName := channelEntry.Name()
+		files, err := os.ReadDir(filepath.Join(s.root, channelName))
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if file.IsDir() || filepath.Ext(file.Name()) != ".jsonl" {
+				continue
+			}
+			path := filepath.Join(s.root, channelName, file.Name())
+			info, err := file.Info()
+			if err != nil {
+				return nil, err
+			}
+			conversation := Conversation{Channel: channelName, Conversation: strings.TrimSuffix(file.Name(), ".jsonl"), Path: path, UpdatedAt: info.ModTime()}
+			entries, err := readRecentEntries(path, 1, 4096)
+			if err != nil {
+				return nil, err
+			}
+			if len(entries) > 0 {
+				last := entries[len(entries)-1]
+				conversation.LastRole = last.Role
+				conversation.Preview = strings.ReplaceAll(strings.TrimSpace(last.Content), "\n", " ")
+				if runes := []rune(conversation.Preview); len(runes) > 120 {
+					conversation.Preview = string(runes[:120]) + "…"
+				}
+				if !last.At.IsZero() {
+					conversation.UpdatedAt = last.At
+				}
+			}
+			conversations = append(conversations, conversation)
+			if limit > 0 && len(conversations) >= limit*2 {
+				conversations = newestConversations(conversations, limit)
+			}
+		}
+	}
+	return newestConversations(conversations, limit), nil
+}
+
+// ListUserActivity returns the newest accepted user activity per conversation.
+// It deliberately ignores assistant and notification entries so proactive
+// delivery cannot make its own destination appear recently user-active. The
+// bounded tail keeps recipient resolution independent of unbounded transcripts.
+func (s *Store) ListUserActivity(limit int) ([]Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var conversations []Conversation
+	for _, channelEntry := range channels {
+		if !channelEntry.IsDir() {
+			continue
+		}
+		channelName := channelEntry.Name()
+		files, err := os.ReadDir(filepath.Join(s.root, channelName))
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if file.IsDir() || filepath.Ext(file.Name()) != ".jsonl" {
+				continue
+			}
+			path := filepath.Join(s.root, channelName, file.Name())
+			conversationName := strings.TrimSuffix(file.Name(), ".jsonl")
+			var activity struct {
+				At time.Time `json:"at"`
+			}
+			if data, readErr := os.ReadFile(s.userActivityPath(channelName, conversationName)); readErr == nil && json.Unmarshal(data, &activity) == nil && !activity.At.IsZero() {
+				conversations = append(conversations, Conversation{
+					Channel: channelName, Conversation: conversationName, Path: path,
+					UpdatedAt: activity.At.UTC(), LastRole: "user",
+				})
+				continue
+			}
+			entries, err := readRecentEntries(path, 256, 512*1024)
+			if err != nil {
+				return nil, err
+			}
+			for index := len(entries) - 1; index >= 0; index-- {
+				entry := entries[index]
+				if entry.Role != "user" || entry.At.IsZero() {
+					continue
+				}
+				conversations = append(conversations, Conversation{
+					Channel: channelName, Conversation: conversationName,
+					Path: path, UpdatedAt: entry.At, LastRole: "user",
+				})
+				break
+			}
+		}
+	}
+	return newestConversations(conversations, limit), nil
+}
+
+// Latest returns the most recently updated conversation for one channel
+// without retaining transcript bodies. Startup uses it to resume the last TUI
+// conversation only when this process becomes the first workspace owner.
+func (s *Store) Latest(channel string) (Conversation, bool, error) {
+	directory := filepath.Join(s.root, clean(channel))
+	files, err := os.ReadDir(directory)
+	if os.IsNotExist(err) {
+		return Conversation{}, false, nil
+	}
+	if err != nil {
+		return Conversation{}, false, err
+	}
+	var latest Conversation
+	found := false
+	for _, file := range files {
+		if file.IsDir() || filepath.Ext(file.Name()) != ".jsonl" {
+			continue
+		}
+		path := filepath.Join(directory, file.Name())
+		info, err := file.Info()
+		if err != nil {
+			return Conversation{}, false, err
+		}
+		candidate := Conversation{
+			Channel: channel, Conversation: strings.TrimSuffix(file.Name(), ".jsonl"),
+			Path: path, UpdatedAt: info.ModTime(),
+		}
+		entries, err := readRecentEntries(path, 1, 4096)
+		if err != nil {
+			return Conversation{}, false, err
+		}
+		if len(entries) > 0 && !entries[0].At.IsZero() {
+			candidate.UpdatedAt = entries[0].At
+		}
+		if !found || candidate.UpdatedAt.After(latest.UpdatedAt) {
+			latest = candidate
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
+func newestConversations(conversations []Conversation, limit int) []Conversation {
+	sort.Slice(conversations, func(i, j int) bool { return conversations[i].UpdatedAt.After(conversations[j].UpdatedAt) })
+	if limit <= 0 || len(conversations) <= limit {
+		return conversations
+	}
+	return append([]Conversation(nil), conversations[:limit]...)
+}
+
+// Branch streams an existing transcript to a new TUI conversation. The source
+// transport history remains untouched and future messages append independently.
+func (s *Store) Branch(sourceChannel, sourceConversation string) (string, string, error) {
+	return s.BranchTo(sourceChannel, sourceConversation, "tui")
+}
+
+// BranchTo streams an existing transcript to a new conversation owned by the
+// requested target channel. It captures the source's current size, so later
+// source messages never leak into the independent branch.
+func (s *Store) BranchTo(sourceChannel, sourceConversation, targetChannel string) (string, string, error) {
+	s.mu.Lock()
+	source := s.Path(sourceChannel, sourceConversation)
+	input, err := os.Open(source)
+	if err != nil {
+		s.mu.Unlock()
+		return "", "", err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		s.mu.Unlock()
+		return "", "", err
+	}
+	targetDirectory := filepath.Join(s.root, clean(targetChannel))
+	if err := os.MkdirAll(targetDirectory, 0o700); err != nil {
+		s.mu.Unlock()
+		return "", "", err
+	}
+	s.mu.Unlock()
+	output, err := os.CreateTemp(targetDirectory, ".resume-*")
+	if err != nil {
+		return "", "", err
+	}
+	temporary := output.Name()
+	defer os.Remove(temporary)
+	if err := output.Chmod(0o600); err != nil {
+		_ = output.Close()
+		return "", "", err
+	}
+	_, copyErr := io.CopyN(output, input, info.Size())
+	if copyErr == nil {
+		copyErr = output.Sync()
+	}
+	closeErr := output.Close()
+	if copyErr != nil || closeErr != nil {
+		if copyErr != nil {
+			return "", "", copyErr
+		}
+		return "", "", closeErr
+	}
+	for attempts := 0; attempts < 100; attempts++ {
+		id, err := shortid.New()
+		if err != nil {
+			return "", "", err
+		}
+		conversation := "resume-" + id
+		destination := s.Path(targetChannel, conversation)
+		if err := os.Link(temporary, destination); err == nil {
+			if _, appendErr := s.Append(targetChannel, conversation, Entry{Role: "correlation", RecoveryBaseline: true}); appendErr != nil {
+				_ = os.Remove(destination)
+				return "", "", appendErr
+			}
+			return conversation, destination, nil
+		} else if !os.IsExist(err) {
+			return "", "", err
+		}
+	}
+	return "", "", errors.New("cannot allocate a unique resumed conversation")
+}
+
+// Clear atomically removes one channel conversation's durable history.
+func (s *Store) Clear(channel, conversation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.Remove(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		_ = os.Remove(s.userActivityPath(channel, conversation))
+		return nil
+	}
+	if err == nil {
+		_ = os.Remove(s.userActivityPath(channel, conversation))
+	}
+	return err
+}
+
+// RemoveOlderThan removes durable conversations whose last valid entry time
+// (falling back to file modification time for empty histories) is strictly
+// before cutoff. Protected keys use "channel\x00conversation".
+func (s *Store) RemoveOlderThan(cutoff time.Time, protected map[string]bool) CleanupResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := CleanupResult{}
+	rootInfo, err := os.Lstat(s.root)
+	if os.IsNotExist(err) {
+		return result
+	}
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		result.Failed++
+		return result
+	}
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return result
+	}
+	if err != nil {
+		result.Failed++
+		return result
+	}
+	for _, channelEntry := range channels {
+		if !channelEntry.IsDir() {
+			continue
+		}
+		channelName := channelEntry.Name()
+		directory := filepath.Join(s.root, channelName)
+		files, err := os.ReadDir(directory)
+		if err != nil {
+			result.Failed++
+			continue
+		}
+		for _, entry := range files {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+				continue
+			}
+			conversation := strings.TrimSuffix(entry.Name(), ".jsonl")
+			if protected[channelName+"\x00"+conversation] {
+				result.Protected++
+				continue
+			}
+			path := filepath.Join(directory, entry.Name())
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				result.Failed++
+				continue
+			}
+			updated := info.ModTime()
+			recent, err := readRecentEntries(path, 1, 4096)
+			if err != nil {
+				result.Failed++
+				continue
+			}
+			if len(recent) > 0 && !recent[0].At.IsZero() {
+				updated = recent[0].At
+			}
+			if !updated.Before(cutoff) {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				result.Failed++
+				continue
+			}
+			_ = os.Remove(s.userActivityPath(channelName, conversation))
+			result.Removed++
+		}
+	}
+	return result
+}
+
+func readEntries(path string) ([]Entry, error) {
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var entries []Entry
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return resolveNotificationOrder(entries), nil
+}
+
+func resolveNotificationOrder(entries []Entry) []Entry {
+	type pending struct {
+		entry Entry
+		index int
+		after int
+		ack   bool
+	}
+	acks := map[string]int{}
+	var notices []pending
+	for _, entry := range entries {
+		if entry.Role == "notification_ack" && entry.EventID != "" {
+			acks[entry.EventID] = entry.AfterChars
+		}
+	}
+	for index, entry := range entries {
+		if entry.Role == "notification_pending" {
+			after, ok := acks[entry.EventID]
+			notices = append(notices, pending{entry: entry, index: index, after: after, ack: ok})
+		}
+	}
+	if len(notices) == 0 {
+		var filtered []Entry
+		for _, entry := range entries {
+			if entry.Role != "notification_ack" && entry.Role != "notification_sending" && entry.Role != "notification_failed" {
+				filtered = append(filtered, entry)
+			}
+		}
+		return filtered
+	}
+	targets := map[int][]pending{}
+	fallback := map[int][]pending{}
+	for _, notice := range notices {
+		target := -1
+		if notice.ack {
+			for i := notice.index + 1; i < len(entries); i++ {
+				if entries[i].Role == "assistant" && entries[i].Sender != "Spy" {
+					target = i
+					break
+				}
+				if entries[i].Terminal && entries[i].Role == "error" {
+					break
+				}
+			}
+		}
+		if target >= 0 {
+			targets[target] = append(targets[target], notice)
+			continue
+		}
+		for i := notice.index + 1; i < len(entries); i++ {
+			if entries[i].Terminal {
+				target = i
+				break
+			}
+		}
+		if target < 0 {
+			target = len(entries) - 1
+		}
+		fallback[target] = append(fallback[target], notice)
+	}
+	var output []Entry
+	for index, entry := range entries {
+		if entry.Role == "notification_pending" || entry.Role == "notification_ack" || entry.Role == "notification_sending" || entry.Role == "notification_failed" {
+			for _, notice := range fallback[index] {
+				output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+			}
+			continue
+		}
+		group := targets[index]
+		if len(group) > 0 {
+			sort.SliceStable(group, func(i, j int) bool { return group[i].after < group[j].after })
+			runes := []rune(entry.Content)
+			start := 0
+			for _, notice := range group {
+				at := min(max(notice.after, start), len(runes))
+				if at > start {
+					segment := entry
+					segment.Content = string(runes[start:at])
+					output = append(output, segment)
+				}
+				output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+				start = at
+			}
+			if start < len(runes) {
+				entry.Content = string(runes[start:])
+				output = append(output, entry)
+			}
+		} else {
+			output = append(output, entry)
+		}
+		for _, notice := range fallback[index] {
+			output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+		}
+	}
+	return output
+}
