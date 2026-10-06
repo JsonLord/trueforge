@@ -1,33 +1,50 @@
-# syntax=docker/dockerfile:1
-#
-# Production image: installs published @truefoundry/trueforge from npm.
-# The app bits match the npm package exactly (not floating monorepo source).
-#
-# Required build-arg:
-#   APP_VERSION — npm version to install, e.g. 0.1.0
-#
-# Example:
-#   docker build --build-arg APP_VERSION=0.1.0 -t trueforge:0.1.0 .
+# syntax=docker/dockerfile:1.7
 
-FROM node:24-slim AS runner
+FROM golang:1.25-bookworm AS spynel-builder
+WORKDIR /src/spynel
+COPY services/spynel ./
+RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/spynel ./cmd/spynel \
+  && mkdir -p /out/lib \
+  && cp /go/pkg/mod/github.com/k2-fsa/sherpa-onnx-go-linux@v1.13.4/lib/x86_64-unknown-linux-gnu/*.so* /out/lib/
+
+FROM node:24-bookworm-slim AS trueforge-builder
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
 WORKDIR /app
-# HOST=0.0.0.0 so Kubernetes Service/probe traffic reaches the process.
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY packages ./packages
+COPY scripts ./scripts
+COPY tsconfig.base.json eslint.config.mjs .prettierrc ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+
+FROM node:24-bookworm-slim AS runtime
 ENV NODE_ENV=production \
-    STANDALONE=false \
-    HOST=0.0.0.0
+    STANDALONE=true \
+    HOST=0.0.0.0 \
+    PORT=7860 \
+    SQLITE_PATH=/data/trueforge/database/trueforge.sqlite \
+    SPYNEL_WORKSPACE=/data/spynel/workspace \
+    SPYNEL_SOCKET=/run/spynel/api.sock
 
-ARG APP_VERSION
-RUN test -n "$APP_VERSION" || (echo "APP_VERSION build-arg is required" >&2 && exit 1)
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init git procps wget \
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd --gid 1000 app \
+  && useradd --uid 1000 --gid app --create-home --shell /bin/bash app \
+  && mkdir -p /app /data/trueforge/database /data/trueforge/state /data/spynel/workspace /run/spynel \
+  && chmod 0700 /run/spynel \
+  && chown -R app:app /app /data /run/spynel
 
-# Fail closed if the version is not on the registry (no workspace fallback).
-RUN npm install --omit=dev "@truefoundry/trueforge@${APP_VERSION}" \
-  && npm cache clean --force
+COPY --from=spynel-builder --chown=app:app /out/spynel /usr/local/bin/spynel
+COPY --from=spynel-builder --chown=app:app /out/lib /usr/local/bin/lib
+COPY --from=trueforge-builder --chown=app:app /app /app
 
-RUN groupadd --gid 10001 trueforge \
-  && useradd --uid 10001 --gid trueforge --shell /usr/sbin/nologin trueforge
-
-EXPOSE 8790
-
-# Same entry as the from-source image / `pnpm start` (launch-only; dist is in the package).
-USER 10001:10001
-CMD ["node", "node_modules/@truefoundry/trueforge/dist/main.js"]
+WORKDIR /app
+USER 1000:1000
+EXPOSE 7860
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/app/scripts/start-integrated.sh"]
