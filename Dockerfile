@@ -27,7 +27,8 @@ ENV NODE_ENV=production \
     PORT=7860 \
     SQLITE_PATH=/data/trueforge/database/trueforge.sqlite \
     SPYNEL_WORKSPACE=/data/spynel/workspace \
-    SPYNEL_SOCKET=/run/spynel/api.sock
+    SPYNEL_SOCKET=/run/spynel/api.sock \
+    LD_LIBRARY_PATH=/usr/local/bin/lib
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init git procps wget \
@@ -40,6 +41,7 @@ RUN apt-get update \
 
 COPY --from=spynel-builder --chown=app:app /out/spynel /usr/local/bin/spynel
 COPY --from=spynel-builder --chown=app:app /out/lib /usr/local/bin/lib
+RUN LD_LIBRARY_PATH=/usr/local/bin/lib /usr/local/bin/spynel --version
 COPY --from=trueforge-builder --chown=app:app /app /app
 
 WORKDIR /app
