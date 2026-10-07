@@ -4,12 +4,19 @@
 import { OpenAPIHono, type RouteHandler } from '@hono/zod-openapi';
 import { InvalidPageTokenError, type AgentSpec } from '@truefoundry/trueforge-core/agent-session';
 import type { Context } from 'hono';
+import {
+  isSpynelAgent,
+  SYSTEM_SPYNEL_AGENT_ID,
+  SYSTEM_SPYNEL_AGENT_NAME,
+  SYSTEM_SPYNEL_DESCRIPTION,
+} from '../../../../integrations/spynel/types/protocol';
 import type { Authorizer } from '../auth/authorizer';
 import { createdBySubjectFromRequestContext, type ResolveRequestContext } from '../auth/identity';
 import configuration from '../config';
 import {
   AgentExternalIdConflictError,
   AgentNameConflictError,
+  parseStoredAgentSpec,
   type AgentRecord,
   type IAgentStore,
 } from '../db/agentStore';
@@ -81,9 +88,33 @@ async function validateManifest<TTransaction>({
 }
 
 export function createAgentsRouter<TTransaction>(deps: AgentsRouterDeps<TTransaction>) {
+  const systemSpynelRecord: AgentRecord = {
+    id: SYSTEM_SPYNEL_AGENT_ID,
+    tenant_id: 'default',
+    name: SYSTEM_SPYNEL_AGENT_NAME,
+    description: SYSTEM_SPYNEL_DESCRIPTION,
+    manifest: parseStoredAgentSpec({
+      model: { name: SYSTEM_SPYNEL_AGENT_NAME },
+    }),
+    external_id: null,
+    created_by_subject: {
+      subject_id: 'system',
+      subject_type: 'system',
+      subject_display_name: 'System',
+    },
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+  };
+
   const listHandler: RouteHandler<typeof listAgentsRoute> = async c => {
     const { limit, page_token: pageToken, agent_name: agentName } = c.req.valid('query');
     const requestContext = deps.resolveRequestContext(c);
+    const matchesSpynel =
+      agentName === undefined ||
+      agentName === '' ||
+      isSpynelAgent(agentName) ||
+      SYSTEM_SPYNEL_AGENT_NAME.toLowerCase().includes(agentName.toLowerCase());
+
     try {
       const { data, pagination } = await listAccessibleAgents({
         store: deps.resolveAgentStore(c),
@@ -94,7 +125,11 @@ export function createAgentsRouter<TTransaction>(deps: AgentsRouterDeps<TTransac
         limit,
         page_token: pageToken,
       });
-      return c.json({ data: data.map(toWireAgent), pagination }, 200);
+      const wireData = data.map(toWireAgent);
+      if (matchesSpynel && !pageToken) {
+        return c.json({ data: [toWireAgent(systemSpynelRecord), ...wireData], pagination }, 200);
+      }
+      return c.json({ data: wireData, pagination }, 200);
     } catch (error) {
       if (error instanceof InvalidPageTokenError) {
         return c.json({ error: { message: error.message } }, 400);
@@ -134,6 +169,9 @@ export function createAgentsRouter<TTransaction>(deps: AgentsRouterDeps<TTransac
 
   const getHandler: RouteHandler<typeof getAgentRoute> = async c => {
     const { agent_id: agentId } = c.req.valid('param');
+    if (isSpynelAgent(agentId)) {
+      return c.json({ data: toWireAgent(systemSpynelRecord) }, 200);
+    }
     const requestContext = deps.resolveRequestContext(c);
     const record = await agentIfAccessible({
       authorizer: deps.authorizer,
@@ -183,6 +221,9 @@ export function createAgentsRouter<TTransaction>(deps: AgentsRouterDeps<TTransac
 
   const deleteHandler: RouteHandler<typeof deleteAgentRoute> = async c => {
     const { agent_id: agentId } = c.req.valid('param');
+    if (isSpynelAgent(agentId)) {
+      return c.json({ error: { message: 'System agent Spynel cannot be deleted' } }, 404);
+    }
     const requestContext = deps.resolveRequestContext(c);
     const existing = await agentIfAccessible({
       authorizer: deps.authorizer,
@@ -199,6 +240,9 @@ export function createAgentsRouter<TTransaction>(deps: AgentsRouterDeps<TTransac
 
   const putHandler: RouteHandler<typeof putAgentRoute> = async c => {
     const { agent_id: agentId } = c.req.valid('param');
+    if (isSpynelAgent(agentId)) {
+      return c.json({ error: { message: 'System agent Spynel cannot be modified' } }, 404);
+    }
     const body = c.req.valid('json');
     const requestContext = deps.resolveRequestContext(c);
     const existing = await agentIfAccessible({

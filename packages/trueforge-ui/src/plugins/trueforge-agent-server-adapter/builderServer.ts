@@ -9,7 +9,22 @@ import { toUiConnectorFromReadEntry, toUiTool } from './catalogs/connectorCatalo
 import { toHarnessAgentSpec, toUiAgentSpec } from './chatServer.js';
 import { createTrueForgeClient, type CreateTrueForgeClientOptions } from './client.js';
 import { listConfiguredMcpServers, listSkills } from './lists.js';
-import type { HarnessAgentSpec } from './types.js';
+import {
+  isSpynelAgent,
+  SYSTEM_SPYNEL_AGENT_ID,
+  SYSTEM_SPYNEL_AGENT_NAME,
+  SYSTEM_SPYNEL_DESCRIPTION,
+  type HarnessAgentSpec,
+} from './types.js';
+
+export const SYSTEM_SPYNEL_LIBRARY_ENTRY: AgentLibraryEntry = {
+  name: SYSTEM_SPYNEL_AGENT_NAME,
+  agentId: SYSTEM_SPYNEL_AGENT_ID,
+  description: SYSTEM_SPYNEL_DESCRIPTION,
+  agentSpec: {
+    model: { name: SYSTEM_SPYNEL_AGENT_NAME },
+  },
+};
 
 export type CreateHarnessBuilderServerOptions = CreateTrueForgeClientOptions & {
   client?: TrueForge;
@@ -125,16 +140,34 @@ export function createHarnessBuilderServer(
       const limit = clampAgentsPageSize(req?.limit ?? AGENTS_PAGE_DEFAULT);
       const offset = req?.offset ?? 0;
       const query = req?.query?.trim();
+      const queryLower = query?.toLowerCase();
+
+      const matchesSpynel =
+        queryLower === undefined ||
+        queryLower === '' ||
+        SYSTEM_SPYNEL_AGENT_NAME.toLowerCase().includes(queryLower) ||
+        SYSTEM_SPYNEL_AGENT_ID.toLowerCase().includes(queryLower) ||
+        SYSTEM_SPYNEL_DESCRIPTION.toLowerCase().includes(queryLower);
+
       const rows = await listAgentsPage({
         client,
         limit,
         offset,
         ...(query === undefined || query === '' ? {} : { agentName: query }),
       });
-      return rows.map(toLibraryEntry);
+      const nativeEntries = rows.map(toLibraryEntry);
+
+      if (matchesSpynel && offset === 0) {
+        return [SYSTEM_SPYNEL_LIBRARY_ENTRY, ...nativeEntries];
+      }
+
+      return nativeEntries;
     },
 
     async saveAgent({ agentName, description: descriptionRaw, agentSpec, intent }) {
+      if (isSpynelAgent(agentName)) {
+        throw new Error('System agent Spynel cannot be modified');
+      }
       const manifest = toHarnessAgentSpec(agentSpec);
       const description = descriptionRaw?.trim();
       if (intent === 'update') {
@@ -161,6 +194,9 @@ export function createHarnessBuilderServer(
     },
 
     async deleteAgent({ agentName }) {
+      if (isSpynelAgent(agentName)) {
+        throw new Error('System agent Spynel cannot be deleted');
+      }
       const agents = await drainAgentsList(client);
       const existing = agents.find(agent => agent.name === agentName);
       if (!existing) return;
