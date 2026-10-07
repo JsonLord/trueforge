@@ -24,7 +24,13 @@ import type {
 } from '../../server/types.js';
 import { createTrueForgeClient, type CreateTrueForgeClientOptions } from './client.js';
 import { toUiEventItem, toUiStreamingEvent, toUiTurnState } from './toUiTurnState.js';
-import type { HarnessAgentSpec, HarnessMcpServerMount, HarnessSkillMount } from './types.js';
+import {
+  isSpynelAgent,
+  SYSTEM_SPYNEL_AGENT_NAME,
+  type HarnessAgentSpec,
+  type HarnessMcpServerMount,
+  type HarnessSkillMount,
+} from './types.js';
 
 export type { HarnessAgentSpec, HarnessMcpServerMount, HarnessSkillMount } from './types.js';
 export type CreateHarnessChatServerOptions = CreateTrueForgeClientOptions & {
@@ -172,8 +178,6 @@ export function createHarnessChatServer(
 ): AgentChatServer<HarnessAgentSpec, HarnessUiSession, HarnessCreateSessionRequest> {
   const client = options.client ?? createTrueForgeClient(options);
   return {
-    // The sandbox is resolved server-side from the turn, so `sandboxId` is accepted for parity
-    // with hosts that address sandboxes directly and deliberately not forwarded.
     async downloadSandboxFile({ sessionId, turnId, path }) {
       const response = await client.sessions.downloadSandboxFile(sessionId, turnId, { path });
       return response.blob();
@@ -182,8 +186,9 @@ export function createHarnessChatServer(
     async createSession(request) {
       const metadata = createSessionMetadata(request);
       if (request.agentName !== undefined && request.agentName.length > 0) {
+        const agentName = isSpynelAgent(request.agentName) ? SYSTEM_SPYNEL_AGENT_NAME : request.agentName;
         const created = await client.sessions.create({
-          agent: { name: request.agentName },
+          agent: { name: agentName },
           ...(metadata === undefined ? {} : { metadata }),
         });
         return toUiSession(created.data);
@@ -219,7 +224,6 @@ export function createHarnessChatServer(
     },
 
     async updateSession({ sessionId, agentSpec }) {
-      // Named (reference) sessions reject agent updates server-side.
       const response = await client.sessions.update(sessionId, {
         ...(agentSpec === undefined ? {} : { agent: { spec: toHarnessAgentSpec(agentSpec) } }),
       });
@@ -252,7 +256,6 @@ export function createHarnessChatServer(
       }
     },
 
-    /** Resume a live turn; omitted/0 `afterSequenceNumber` replays from the start. */
     async *subscribeToTurn({
       sessionId,
       turnId,

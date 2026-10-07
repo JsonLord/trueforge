@@ -27,20 +27,21 @@ ENV NODE_ENV=production \
     PORT=7860 \
     SQLITE_PATH=/data/trueforge/database/trueforge.sqlite \
     SPYNEL_WORKSPACE=/data/spynel/workspace \
-    SPYNEL_SOCKET=/run/spynel/api.sock
+    SPYNEL_SOCKET=/run/spynel/api.sock \
+    LD_LIBRARY_PATH=/usr/local/bin/lib
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init git procps wget \
   && rm -rf /var/lib/apt/lists/* \
-  && groupadd --gid 1000 app \
-  && useradd --uid 1000 --gid app --create-home --shell /bin/bash app \
   && mkdir -p /app /data/trueforge/database /data/trueforge/state /data/spynel/workspace /run/spynel \
   && chmod 0700 /run/spynel \
-  && chown -R app:app /app /data /run/spynel
+  && chown -R 1000:1000 /app /data /run/spynel
 
-COPY --from=spynel-builder --chown=app:app /out/spynel /usr/local/bin/spynel
-COPY --from=spynel-builder --chown=app:app /out/lib /usr/local/bin/lib
-COPY --from=trueforge-builder --chown=app:app /app /app
+COPY --from=spynel-builder --chown=1000:1000 /out/spynel /usr/local/bin/spynel
+COPY --from=spynel-builder --chown=1000:1000 /out/lib /usr/local/bin/lib
+RUN LD_LIBRARY_PATH=/usr/local/bin/lib /usr/local/bin/spynel --version
+COPY --from=trueforge-builder --chown=1000:1000 /app /app
+RUN chmod +x /app/scripts/*.sh
 
 WORKDIR /app
 USER 1000:1000

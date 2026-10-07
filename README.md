@@ -1,3 +1,12 @@
+---
+title: TrueForge Spynel
+emoji: 🕸️
+colorFrom: indigo
+colorTo: gray
+sdk: docker
+app_port: 7860
+---
+
 <p align="center">
   <a href="https://trueforge.dev">
     <picture>

@@ -99,7 +99,9 @@ Edits under `/app` are disposable and should be committed and rebuilt. Persisten
 
 ## Hugging Face preparation
 
-Do not deploy until the blockers above and the local validation matrix are complete. The eventual Docker Space should use:
+The initial Hugging Face deployment must be configured as a **PRIVATE SPACE** because TrueForge runs with `STANDALONE=true` and does not provide public authentication in this baseline.
+
+The Docker Space should use:
 
 - public port/Variable: `PORT=7860`;
 - persistent storage mounted at `/data`;

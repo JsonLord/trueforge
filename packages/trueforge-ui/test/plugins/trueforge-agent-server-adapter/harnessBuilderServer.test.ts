@@ -345,8 +345,9 @@ describe('harnessBuilderServer', () => {
 
     const builder = createHarnessBuilderServer({ fetch: fetchMock });
     const all = await builder.searchAgents();
-    assert.equal(all.length, 2);
-    assert.deepEqual(all[0], {
+    assert.equal(all.length, 3);
+    assert.equal(all[0]?.name, 'Spynel');
+    assert.deepEqual(all[1], {
       name: 'reviewer',
       agentId: 'agt_1',
       createdBySubject: {

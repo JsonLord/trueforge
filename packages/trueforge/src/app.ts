@@ -24,6 +24,7 @@ import { createInternalMetricsRouter } from './apis/sessionMetrics';
 import { createInternalSessionsRouter, createSessionsRouter } from './apis/sessions';
 import { createSettingsRouter } from './apis/settings';
 import { createAvailableSkillsRouter, type ResolveSkillStore } from './apis/skills';
+import { createSpynelInternalRouter } from './apis/spynel';
 import { createTurnsRouter } from './apis/turns';
 import type { Authenticator } from './auth/authenticator';
 import type { Authorizer } from './auth/authorizer';
@@ -249,6 +250,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   app.use('*', createRequestBodyLimitMiddleware(configuration.MAX_REQUEST_BODY_BYTES));
 
   app.get('/healthz', c => c.json({ status: 'ok', version: PACKAGE_VERSION }));
+  app.get('/health', c => c.json({ status: 'ok', version: PACKAGE_VERSION }));
 
   app.route(
     '/api/v1/auth',
@@ -414,6 +416,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
       authMiddleware,
     ),
   );
+  app.route('/api/internal/spynel', withAuth(createSpynelInternalRouter(), authMiddleware));
   app.route(
     '/api/internal',
     withAuth(
@@ -473,6 +476,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   const openApiSpecPath = `${uiBasePath}api/v1/openapi.json`;
   const openApiServerUrl = uiBasePath === '/' ? undefined : uiBasePath.replace(/\/$/, '');
   app.get('/api/v1/docs', swaggerUI({ url: openApiSpecPath }));
+  app.get('/api-docs', swaggerUI({ url: openApiSpecPath }));
   app.get('/api/v1/openapi.json', c =>
     c.json(
       buildOpenApiDocument(app, {

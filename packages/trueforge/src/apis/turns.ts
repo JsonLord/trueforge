@@ -31,6 +31,8 @@ import type { Context } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 import type { Logger } from 'winston';
+import { SpynelChatAdapter } from '../../../../integrations/spynel/adapter/SpynelChatAdapter';
+import { SpynelClient } from '../../../../integrations/spynel/client/SpynelClient';
 import type { Authorizer } from '../auth/authorizer';
 import type { ResolveRequestContext } from '../auth/identity';
 import configuration, { isTrueFoundryModeEnabled } from '../config';
@@ -757,6 +759,117 @@ export function createTurnsRouter(deps: TurnsRouterDeps) {
       })
     ) {
       return c.json({ error: { message: FORBIDDEN_CREATE_TURN } }, 403);
+    }
+
+    if (
+      session.record.agent.type === 'reference' &&
+      (session.record.agent.name === 'Spynel' || session.record.agent.id === 'system-spynel')
+    ) {
+      if (body.input) {
+        for (const item of body.input) {
+          if (item.type === 'user.message' && Array.isArray(item.content)) {
+            if (item.content.some(part => part.type === 'file')) {
+              return c.json({ error: { message: 'Attachments are not supported for Spynel sessions' } }, 400);
+            }
+          }
+        }
+      }
+
+      const socketPath = process.env['SPYNEL_SOCKET'] ?? '/run/spynel/api.sock';
+      const statePath = process.env['SPYNEL_STATE_PATH'] ?? '/data/trueforge/state/spynel-sessions.json';
+      const spynelClient = new SpynelClient({ socketPath });
+      const spynelAdapter = new SpynelChatAdapter({ client: spynelClient, statePath });
+
+      const text = deriveSessionTitle(body.input) ?? '';
+      const sourceMessageId = `msg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      await spynelAdapter.send({ sessionId, sourceMessageId, text });
+
+      if (!body.stream) {
+        const historyResult = await spynelAdapter.history(sessionId);
+        const lastEvent = historyResult.events[historyResult.events.length - 1];
+        const turnRecord = {
+          id: `spynel-turn-${Date.now()}`,
+          session_id: sessionId,
+          previous_turn_id: body.previous_turn_id ?? null,
+          input: body.input ?? [],
+          state: {
+            status: 'done' as const,
+            completedAt: new Date().toISOString(),
+            output: lastEvent?.final_text ?? lastEvent?.text ?? 'Spynel operation completed.',
+          },
+          created_at: new Date(),
+        };
+        return c.json({ data: toWireTurn(turnRecord as any) }, 200);
+      }
+
+      return streamSSE(c, async stream => {
+        const now = new Date().toISOString();
+        let seq = 0;
+
+        await stream.writeSSE(
+          turnEventSsePayload(
+            {
+              id: `evt-${Date.now()}-0`,
+              type: EventType.THREAD_CREATED,
+              thread_id: sessionId,
+              title: 'Spynel',
+              agent_info: { type: 'dynamic', name: 'Spynel', input: 'Spynel' },
+              created_at: now,
+            } as unknown as TurnStreamingEvent,
+            seq++,
+          ),
+        );
+
+        let lastText = '';
+        let done = false;
+        for (let attempt = 0; attempt < 60; attempt++) {
+          try {
+            const historyResult = await spynelAdapter.history(sessionId);
+            for (const evt of historyResult.events) {
+              const textVal = evt.final_text ?? evt.text ?? '';
+              if (textVal && textVal !== lastText) {
+                const delta = textVal.startsWith(lastText) ? textVal.slice(lastText.length) : textVal;
+                if (delta) {
+                  await stream.writeSSE(
+                    turnEventSsePayload(
+                      {
+                        id: evt.id,
+                        type: EventType.MODEL_MESSAGE_DELTA,
+                        thread_id: sessionId,
+                        delta: { content: delta },
+                        created_at: evt.at || new Date().toISOString(),
+                      } as unknown as TurnStreamingEvent,
+                      seq++,
+                    ),
+                  );
+                  lastText = textVal;
+                }
+              }
+              if (evt.done) {
+                done = true;
+              }
+            }
+          } catch {
+            // ignore temporary polling errors
+          }
+          if (done) break;
+          await new Promise(r => setTimeout(r, 200));
+        }
+
+        await stream.writeSSE(
+          turnEventSsePayload(
+            {
+              id: `evt-${Date.now()}-done`,
+              type: EventType.TURN_DONE,
+              thread_id: sessionId,
+              state: { status: 'done', output: { content: lastText || 'Spynel operation completed.' } },
+              created_at: new Date().toISOString(),
+            } as unknown as TurnStreamingEvent,
+            seq++,
+          ),
+        );
+        await stream.close();
+      });
     }
 
     let referencedAgent: AgentRecord | undefined;
