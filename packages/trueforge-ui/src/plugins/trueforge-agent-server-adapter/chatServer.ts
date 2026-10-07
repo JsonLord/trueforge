@@ -20,16 +20,12 @@ import type {
   Session,
   Turn,
   TurnInputItem,
-  TurnStreamingEvent,
   UserMessageContent,
 } from '../../server/types.js';
 import { createTrueForgeClient, type CreateTrueForgeClientOptions } from './client.js';
-import { DirectSpynelChatAdapter } from './spynelAdapter.js';
 import { toUiEventItem, toUiStreamingEvent, toUiTurnState } from './toUiTurnState.js';
 import {
   isSpynelAgent,
-  isSpynelSession,
-  SYSTEM_SPYNEL_AGENT_ID,
   SYSTEM_SPYNEL_AGENT_NAME,
   type HarnessAgentSpec,
   type HarnessMcpServerMount,
@@ -181,39 +177,18 @@ export function createHarnessChatServer(
   options: CreateHarnessChatServerOptions = {},
 ): AgentChatServer<HarnessAgentSpec, HarnessUiSession, HarnessCreateSessionRequest> {
   const client = options.client ?? createTrueForgeClient(options);
-  const spynelAdapter = new DirectSpynelChatAdapter();
-  const spynelSessions = new Map<string, HarnessUiSession>();
-
   return {
     async downloadSandboxFile({ sessionId, turnId, path }) {
-      if (isSpynelSession(sessionId)) {
-        throw new Error('Sandbox downloads are not applicable for Spynel sessions');
-      }
       const response = await client.sessions.downloadSandboxFile(sessionId, turnId, { path });
       return response.blob();
     },
 
     async createSession(request) {
-      if (isSpynelAgent(request.agentName)) {
-        const id = `spynel-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-        const now = new Date().toISOString();
-        const session: HarnessUiSession = {
-          id,
-          agentName: SYSTEM_SPYNEL_AGENT_NAME,
-          isMutable: false,
-          isCreateAgent: false,
-          createdAt: now,
-          updatedAt: now,
-          title: 'Spynel Control Plane',
-        };
-        spynelSessions.set(id, session);
-        return session;
-      }
-
       const metadata = createSessionMetadata(request);
       if (request.agentName !== undefined && request.agentName.length > 0) {
+        const agentName = isSpynelAgent(request.agentName) ? SYSTEM_SPYNEL_AGENT_NAME : request.agentName;
         const created = await client.sessions.create({
-          agent: { name: request.agentName },
+          agent: { name: agentName },
           ...(metadata === undefined ? {} : { metadata }),
         });
         return toUiSession(created.data);
@@ -229,56 +204,26 @@ export function createHarnessChatServer(
     },
 
     async listSessions(request = {}) {
-      const nativePage = await client.sessions.list({
+      const page = await client.sessions.list({
         ...(request.limit === undefined ? {} : { limit: request.limit }),
         ...(request.order === undefined ? {} : { order: request.order }),
         ...(request.pageToken === undefined ? {} : { pageToken: request.pageToken }),
         ...(request.agentId === undefined || request.agentId.length === 0 ? {} : { agentId: request.agentId }),
         ...(request.createdByMe === undefined ? {} : { createdByMe: request.createdByMe }),
       });
-      const nativeResult = toListResult(nativePage, toUiSession);
-      if (request.agentId === SYSTEM_SPYNEL_AGENT_ID || request.agentId === SYSTEM_SPYNEL_AGENT_NAME) {
-        return { data: Array.from(spynelSessions.values()) };
-      }
-      return {
-        data: [...Array.from(spynelSessions.values()), ...nativeResult.data],
-        ...(nativeResult.nextPageToken ? { nextPageToken: nativeResult.nextPageToken } : {}),
-      };
+      return toListResult(page, toUiSession);
     },
 
     async getSession({ sessionId }) {
-      if (isSpynelSession(sessionId)) {
-        const existing = spynelSessions.get(sessionId);
-        if (existing) return existing;
-        const now = new Date().toISOString();
-        const session: HarnessUiSession = {
-          id: sessionId,
-          agentName: SYSTEM_SPYNEL_AGENT_NAME,
-          isMutable: false,
-          isCreateAgent: false,
-          createdAt: now,
-          updatedAt: now,
-          title: 'Spynel Control Plane',
-        };
-        spynelSessions.set(sessionId, session);
-        return session;
-      }
       const response = await client.sessions.get(sessionId);
       return toUiSession(response.data);
     },
 
     async deleteSession({ sessionId }) {
-      if (isSpynelSession(sessionId)) {
-        spynelSessions.delete(sessionId);
-        return;
-      }
       await client.sessions.delete(sessionId);
     },
 
     async updateSession({ sessionId, agentSpec }) {
-      if (isSpynelSession(sessionId)) {
-        throw new Error('System agent Spynel session is not editable');
-      }
       const response = await client.sessions.update(sessionId, {
         ...(agentSpec === undefined ? {} : { agent: { spec: toHarnessAgentSpec(agentSpec) } }),
       });
@@ -294,77 +239,6 @@ export function createHarnessChatServer(
       input?: TurnInputItem[];
       previousTurnId?: string;
     }) {
-      if (isSpynelSession(sessionId)) {
-        let userText = '';
-        if (input !== undefined) {
-          for (const item of input) {
-            if (item.type === 'user.message') {
-              if (typeof item.content === 'string') {
-                userText += item.content;
-              } else if (Array.isArray(item.content)) {
-                for (const part of item.content) {
-                  if (part.type === 'file') {
-                    throw new Error('Attachments are not supported for Spynel sessions');
-                  }
-                  if (part.type === 'text') {
-                    userText += part.text;
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        const sourceMessageId = `msg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        await spynelAdapter.send({
-          sessionId,
-          sourceMessageId,
-          text: userText,
-        });
-
-        const historyResult = await spynelAdapter.history(sessionId);
-        const lastEvent = historyResult.events[historyResult.events.length - 1];
-        const responseText = lastEvent?.final_text ?? lastEvent?.text ?? 'Spynel operation completed.';
-
-        const now = new Date().toISOString();
-        yield {
-          sequenceNumber: 0,
-          event: {
-            id: `evt-created-${Date.now()}`,
-            type: 'thread.created',
-            threadId: sessionId,
-            title: 'Spynel',
-            agentInfo: { name: SYSTEM_SPYNEL_AGENT_NAME, input: SYSTEM_SPYNEL_AGENT_NAME },
-            createdAt: now,
-          } as TurnStreamingEvent,
-        };
-
-        yield {
-          sequenceNumber: 1,
-          event: {
-            id: `evt-delta-${Date.now()}`,
-            type: 'model.message.delta',
-            threadId: sessionId,
-            delta: {
-              content: responseText,
-            },
-            createdAt: now,
-          } as TurnStreamingEvent,
-        };
-
-        yield {
-          sequenceNumber: 2,
-          event: {
-            id: `evt-done-${Date.now()}`,
-            type: 'thread.done',
-            threadId: sessionId,
-            state: { status: 'done', completedAt: now },
-            createdAt: now,
-          } as TurnStreamingEvent,
-        };
-        return;
-      }
-
       const stream = await client.sessions.createTurnStream(sessionId, {
         ...(input === undefined ? {} : { input: toHarnessInput(input) }),
         ...(previousTurnId === undefined ? {} : { previousTurnId }),
@@ -391,21 +265,6 @@ export function createHarnessChatServer(
       turnId: string;
       afterSequenceNumber?: number;
     }) {
-      if (isSpynelSession(sessionId)) {
-        const now = new Date().toISOString();
-        yield {
-          sequenceNumber: 0,
-          event: {
-            id: `evt-done-${Date.now()}`,
-            type: 'thread.done',
-            threadId: sessionId,
-            state: { status: 'done', completedAt: now },
-            createdAt: now,
-          } as TurnStreamingEvent,
-        };
-        return;
-      }
-
       const stream = await client.sessions.subscribeToTurn(sessionId, turnId, {
         ...(afterSequenceNumber === undefined ? {} : { afterSequenceNumber }),
       });
@@ -423,27 +282,10 @@ export function createHarnessChatServer(
     },
 
     async cancelSession({ sessionId }) {
-      if (isSpynelSession(sessionId)) {
-        const sourceMessageId = `stop-${Date.now()}`;
-        await spynelAdapter.stop({ sessionId, sourceMessageId });
-        return;
-      }
       await client.sessions.cancel(sessionId);
     },
 
     async listTurns({ sessionId, limit, pageToken }) {
-      if (isSpynelSession(sessionId)) {
-        const historyResult = await spynelAdapter.history(sessionId);
-        const turns: Turn[] = historyResult.events.map(event => ({
-          id: event.id,
-          turnId: event.id,
-          sessionId,
-          createdAt: event.at,
-          state: event.done ? { status: 'done', completedAt: event.at } : { status: 'running' },
-          input: event.text ? [{ type: 'user.message', content: event.text }] : [],
-        }));
-        return { data: turns };
-      }
       const page = await client.sessions.listTurns(sessionId, {
         ...(limit === undefined ? {} : { limit }),
         ...(pageToken === undefined ? {} : { pageToken }),
@@ -452,27 +294,11 @@ export function createHarnessChatServer(
     },
 
     async getTurn({ sessionId, turnId }) {
-      if (isSpynelSession(sessionId)) {
-        const historyResult = await spynelAdapter.history(sessionId);
-        const event = historyResult.events.find(e => e.id === turnId);
-        if (!event) throw new Error(`Turn not found: ${turnId}`);
-        return {
-          id: event.id,
-          turnId: event.id,
-          sessionId,
-          createdAt: event.at,
-          state: event.done ? { status: 'done', completedAt: event.at } : { status: 'running' },
-          input: event.text ? [{ type: 'user.message', content: event.text }] : [],
-        };
-      }
       const response = await client.sessions.getTurn(sessionId, turnId);
       return toUiTurn(response.data);
     },
 
     async listEvents({ sessionId, pageToken, lastTurnId, limit }) {
-      if (isSpynelSession(sessionId)) {
-        return { data: [] };
-      }
       const page = await client.sessions.listEvents(sessionId, {
         ...(pageToken === undefined ? {} : { pageToken }),
         ...(lastTurnId === undefined ? {} : { lastTurnId }),
