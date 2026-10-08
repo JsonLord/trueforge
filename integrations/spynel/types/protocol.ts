@@ -44,7 +44,7 @@ export interface AppliedSpynelEvents {
 }
 
 export const SYSTEM_SPYNEL_AGENT_ID = 'system-spynel';
-export const SYSTEM_SPYNEL_AGENT_NAME = 'Spynel';
+export const SYSTEM_SPYNEL_AGENT_NAME = 'spynel';
 export const SYSTEM_SPYNEL_DESCRIPTION = 'Persistent orchestration control plane';
 
 export function isSpynelAgent(agentIdOrName: string | undefined | null): boolean {

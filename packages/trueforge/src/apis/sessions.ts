@@ -334,12 +334,12 @@ export function createSessionsRouter(deps: SessionsRouterDeps) {
     const requestContext = deps.resolveRequestContext(c);
 
     if (isSessionAgentNameRef(body.agent)) {
-      if (body.agent.name === 'Spynel' || body.agent.name === 'system-spynel') {
+      if (body.agent.name === 'spynel' || body.agent.name === 'Spynel' || body.agent.name === 'system-spynel') {
         const session = await deps.sessions.create({
           tenant_id: requestContext.tenant_id,
           session_id: sessionId,
           created_by_subject: createdBySubjectFromRequestContext(requestContext),
-          agent: { type: 'reference', id: 'system-spynel', name: 'Spynel' },
+          agent: { type: 'reference', id: 'system-spynel', name: 'spynel' },
           metadata: body.metadata,
           external_id: null,
         });
@@ -550,7 +550,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps) {
       return c.json({ error: { message: FORBIDDEN_SESSION_ACCESS } }, 403);
     }
 
-    if (session.record.agent.type === 'reference' && (session.record.agent.name === 'Spynel' || session.record.agent.id === 'system-spynel')) {
+    if (session.record.agent.type === 'reference' && (session.record.agent.name === 'spynel' || session.record.agent.name === 'Spynel' || session.record.agent.id === 'system-spynel')) {
       const socketPath = process.env['SPYNEL_SOCKET'] ?? '/run/spynel/api.sock';
       const statePath = process.env['SPYNEL_STATE_PATH'] ?? '/data/trueforge/state/spynel-sessions.json';
       const spynelClient = new SpynelClient({ socketPath });

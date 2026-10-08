@@ -763,7 +763,7 @@ export function createTurnsRouter(deps: TurnsRouterDeps) {
 
     if (
       session.record.agent.type === 'reference' &&
-      (session.record.agent.name === 'Spynel' || session.record.agent.id === 'system-spynel')
+      ((session.record.agent.name === 'Spynel' || session.record.agent.name === 'spynel') || session.record.agent.id === 'system-spynel')
     ) {
       if (body.input) {
         for (const item of body.input) {
