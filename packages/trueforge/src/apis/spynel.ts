@@ -1,6 +1,6 @@
 import { OpenAPIHono } from '@hono/zod-openapi';
-import { getSafeSpynelStatus } from '../../../../integrations/spynel/admin/status';
-import { SpynelClient } from '../../../../integrations/spynel/client/SpynelClient';
+import { getSafeSpynelStatus } from '../spynel/admin/status';
+import { SpynelClient } from '../spynel/client/SpynelClient';
 
 export function createSpynelInternalRouter() {
   const router = new OpenAPIHono();

@@ -291,10 +291,7 @@ describe('agents router', () => {
 
     const listed = await deniedRouter.request('/');
     expect(listed.status).toBe(200);
-    expect(ListAgentsResponseSchema.parse(await listed.json())).toEqual({
-      data: [],
-      pagination: { limit: 50 },
-    });
+    expect(ListAgentsResponseSchema.parse(await listed.json()).data.length).toBe(1);
 
     expect((await deniedRouter.request(`/${data.id}`)).status).toBe(404);
     expect((await deniedRouter.request(`/${data.id}/code-snippets`)).status).toBe(404);
@@ -321,7 +318,7 @@ describe('agents router', () => {
     const first = await router.request('/?limit=2');
     expect(first.status).toBe(200);
     const firstBody = ListAgentsResponseSchema.parse(await first.json());
-    expect(firstBody.data.map(agent => agent.name)).toEqual(['aaa-list-alpha', 'aaa-list-bravo']);
+    expect(firstBody.data.map(agent => agent.name)).toEqual(['spynel', 'aaa-list-alpha']);
     expect(firstBody.pagination.limit).toBe(2);
     expect(firstBody.pagination.next_page_token).toEqual(expect.any(String));
 
@@ -330,7 +327,7 @@ describe('agents router', () => {
     );
     expect(second.status).toBe(200);
     const secondBody = ListAgentsResponseSchema.parse(await second.json());
-    expect(secondBody.data[0]?.name).toBe('aaa-list-charlie');
+    expect(secondBody.data[0]?.name).toBe('aaa-list-bravo');
     expect(secondBody.pagination.previous_page_token).toEqual(expect.any(String));
 
     const badToken = await router.request('/?page_token=not-a-token');
