@@ -21,8 +21,6 @@ import type { Context } from 'hono';
 import type { RedisClientType } from 'redis';
 import type { Logger } from 'winston';
 import { z } from 'zod';
-import { SpynelChatAdapter } from '../../../../integrations/spynel/adapter/SpynelChatAdapter';
-import { SpynelClient } from '../../../../integrations/spynel/client/SpynelClient';
 import type { Authorizer } from '../auth/authorizer';
 import { createdBySubjectFromRequestContext, type ResolveRequestContext } from '../auth/identity';
 import configuration from '../config';
@@ -45,6 +43,8 @@ import { executorFromTurnId } from '../runtime/peeringIds';
 import { validateAgentSpec } from '../runtime/sessionResources';
 import { honoQueriesToRecord } from '../schemas/deepObjectQuery';
 import { isSessionAgentNameRef, parseListSessionsQuery, type Session } from '../schemas/session';
+import { SpynelChatAdapter } from '../spynel/adapter/SpynelChatAdapter';
+import { SpynelClient } from '../spynel/client/SpynelClient';
 import { newId } from '../utils/id';
 import { agentIfAccessible, canReadAgentBoundResource, resolveManagedAgentIds } from './agentAccess';
 import type { ResolveSkillStore } from './skills';
@@ -334,17 +334,6 @@ export function createSessionsRouter(deps: SessionsRouterDeps) {
     const requestContext = deps.resolveRequestContext(c);
 
     if (isSessionAgentNameRef(body.agent)) {
-      if (body.agent.name === 'spynel' || body.agent.name === 'Spynel' || body.agent.name === 'system-spynel') {
-        const session = await deps.sessions.create({
-          tenant_id: requestContext.tenant_id,
-          session_id: sessionId,
-          created_by_subject: createdBySubjectFromRequestContext(requestContext),
-          agent: { type: 'reference', id: 'system-spynel', name: 'spynel' },
-          metadata: body.metadata,
-          external_id: null,
-        });
-        return c.json({ data: toWireSession(session.record) }, 201);
-      }
       const agent = await agentIfAccessible({
         authorizer: deps.authorizer,
         context: requestContext,
@@ -357,13 +346,16 @@ export function createSessionsRouter(deps: SessionsRouterDeps) {
       if (agent === undefined) {
         return c.json({ error: { message: `Agent not found: ${body.agent.name}` } }, 404);
       }
+
+      const isSpynel = agent.external_id === 'system:spynel';
+
       const session = await deps.sessions.create({
         tenant_id: requestContext.tenant_id,
         session_id: sessionId,
         created_by_subject: createdBySubjectFromRequestContext(requestContext),
         agent: { type: 'reference', id: agent.id, name: agent.name },
         metadata: body.metadata,
-        external_id: null,
+        external_id: isSpynel ? 'system:spynel' : null,
       });
       return c.json({ data: toWireSession(session.record) }, 201);
     }
@@ -550,7 +542,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps) {
       return c.json({ error: { message: FORBIDDEN_SESSION_ACCESS } }, 403);
     }
 
-    if (session.record.agent.type === 'reference' && (session.record.agent.name === 'spynel' || session.record.agent.name === 'Spynel' || session.record.agent.id === 'system-spynel')) {
+    if (session.record.external_id === 'system:spynel') {
       const socketPath = process.env['SPYNEL_SOCKET'] ?? '/run/spynel/api.sock';
       const statePath = process.env['SPYNEL_STATE_PATH'] ?? '/data/trueforge/state/spynel-sessions.json';
       const spynelClient = new SpynelClient({ socketPath });

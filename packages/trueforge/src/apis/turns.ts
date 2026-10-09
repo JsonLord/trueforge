@@ -31,8 +31,6 @@ import type { Context } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 import type { Logger } from 'winston';
-import { SpynelChatAdapter } from '../../../../integrations/spynel/adapter/SpynelChatAdapter';
-import { SpynelClient } from '../../../../integrations/spynel/client/SpynelClient';
 import type { Authorizer } from '../auth/authorizer';
 import type { ResolveRequestContext } from '../auth/identity';
 import configuration, { isTrueFoundryModeEnabled } from '../config';
@@ -66,6 +64,8 @@ import {
 } from '../runtime/sessionResources';
 import { checkSnapshotStatus } from '../sandbox/providerUtils';
 import { MAX_SESSION_TITLE_LENGTH } from '../schemas/session';
+import { SpynelChatAdapter } from '../spynel/adapter/SpynelChatAdapter';
+import { SpynelClient } from '../spynel/client/SpynelClient';
 import { resolveWebSearchProvider } from '../websearch/providers';
 import { canReadAgentBoundResource } from './agentAccess';
 
@@ -761,10 +761,7 @@ export function createTurnsRouter(deps: TurnsRouterDeps) {
       return c.json({ error: { message: FORBIDDEN_CREATE_TURN } }, 403);
     }
 
-    if (
-      session.record.agent.type === 'reference' &&
-      ((session.record.agent.name === 'Spynel' || session.record.agent.name === 'spynel') || session.record.agent.id === 'system-spynel')
-    ) {
+    if (session.record.external_id === 'system:spynel') {
       if (body.input) {
         for (const item of body.input) {
           if (item.type === 'user.message' && Array.isArray(item.content)) {

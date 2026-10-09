@@ -1,3 +1,26 @@
+import { SYSTEM_SPYNEL_AGENT_NAME, SYSTEM_SPYNEL_DESCRIPTION } from './spynel/types/protocol';
+
+async function bootstrapSpynelAgent(agentStore: any) {
+  const existing = await agentStore.getAgent({ tenant_id: 'default', name: SYSTEM_SPYNEL_AGENT_NAME });
+  if (!existing) {
+    await agentStore.createAgent({
+      tenant_id: 'default',
+      name: SYSTEM_SPYNEL_AGENT_NAME,
+      description: SYSTEM_SPYNEL_DESCRIPTION,
+      external_id: 'system:spynel',
+      manifest: {
+        model: { name: SYSTEM_SPYNEL_AGENT_NAME },
+        config: {},
+      },
+      created_by_subject: {
+        subject_id: 'system',
+        subject_type: 'system',
+        subject_display_name: 'System',
+      },
+    });
+  }
+}
+
 /**
  * Server entry point: validates config, migrates the selected database, wires
  * stores, and starts the HTTP server. Any config, migration, or store error
@@ -312,6 +335,7 @@ async function createStandalonePersistence(options: {
 
   const tokenStore = new SqliteOAuthTokenStore(db);
   const agentStore = new SqliteAgentStore(db);
+  await bootstrapSpynelAgent(agentStore);
   const modelProviderStore = new SqliteModelProviderStore(db);
   const mcpServerStore = new McpServerWithAuthStore({
     store: new SqliteMcpServerStore(db),
@@ -407,6 +431,7 @@ async function createDistributedPersistence(options: {
   const sandboxProviderStore = new PostgresSandboxProviderStore(db);
   const skillStore = new PostgresSkillStore(db);
   const agentStore = new PostgresAgentStore(db);
+  await bootstrapSpynelAgent(agentStore);
   const turnSkillsResolverStore = buildTurnSkillsResolverStore({
     persistenceStore: skillStore,
     client: serviceFoundryClient,
